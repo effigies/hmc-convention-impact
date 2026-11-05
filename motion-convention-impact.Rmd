@@ -135,6 +135,11 @@ def relative_parts(params, fd, step=slice(None)):
     return pd.DataFrame({'total': total, 'rotation': rotation, 'translation': total - rotation})
 
 
+def verdict(ok, bold=True):
+    """'borne out' or 'not borne out', the latter in bold unless the caller already bolds it."""
+    return 'borne out' if ok else ('**not borne out**' if bold else 'not borne out')
+
+
 def pct_range(values):
     lo, hi = f'{min(values):.0%}', f'{max(values):.0%}'
     return lo if lo == hi else f'{lo}–{hi}'
@@ -170,6 +175,21 @@ If the conventions' differences change FD by more than a threshold's margin, the
 2. Moving the rotation center by `d` adds about `Δω × d` to each frame-to-frame translation.
    FD's rotation term is at least `50·|Δω|`, so the relative FD change should stay under about `√3·d/50`: 3.5% per mm of center distance in the worst case, less in typical frames.
 3. That shift is linear in the rotations, so each parameter set should be nearly a linear combination of the other, and regressing one out of the other should leave little.
+
+Each section that tests an expectation ends with a verdict. "Negligible" and "little" need numbers; these are the criteria the verdicts use:
+
+```{python}
+NEGLIGIBLE_FD = 0.01  # Expectation 1: changes FD by less than this fraction
+SMALL_RESIDUAL = 0.1  # Expectation 3: residual SD below this fraction of the column's SD
+
+display(
+    Markdown(
+        f'- Expectation 1: Euler order changes the rotations by no more than the largest product '
+        f'of two angles, and changes FD by less than {NEGLIGIBLE_FD:.0%}.\n'
+        f"- Expectation 3: residual SD under {SMALL_RESIDUAL:.0%} of each column's SD."
+    )
+)
+```
 
 ## The 3dvolreg series
 
@@ -266,12 +286,16 @@ rot_diff = (series_params['fsl'][ROTATIONS] - series_params['afni'][ROTATIONS]).
 max_rot_diff = rot_diff.max()
 max_product = pair_products.max()
 max_trans_diff = diff[COLUMNS[:3]].abs().to_numpy().max()
+e1_params = max_rot_diff <= max_product
 
 display(
     Markdown(
-        f'The rotations differ by at most {np.rad2deg(max_rot_diff):.2g}°; the largest product '
-        f'of two angles in any frame is {np.rad2deg(max_product):.2g}°. '
-        f"On FD's 50 mm sphere, that rotation difference is at most {50 * max_rot_diff:.2g} mm. "
+        f'**Expectation 1, parameters: {verdict(e1_params, bold=False)}.** The rotations differ by at most '
+        f'{np.rad2deg(max_rot_diff):.2g}°, against a largest product of two angles of '
+        f'{np.rad2deg(max_product):.2g}° and a largest rotation of '
+        f'{np.rad2deg(angles.max()):.2g}°. '
+        f"On FD's 50 mm sphere, that difference is at most {50 * max_rot_diff:.2g} mm. "
+        'Its effect on FD is tested in the sample, under Center distance. '
         f'The translations differ by up to {max_trans_diff:.2f} mm, because the rotation '
         'centers differ.'
     )
@@ -430,6 +454,20 @@ series_regression.style.format('{:.6f}', subset=['min r2', 'max r2']).format(
 )
 ```
 
+```{python}
+series_resid = series_regression.groupby(level='parameters')['max rel. resid. SD'].max()
+e3_series = {model: sd < SMALL_RESIDUAL for model, sd in series_resid.items()}
+display(
+    Markdown(
+        f'**Expectation 3, series: {verdict(e3_series["6"], bold=False)} for 6 parameters, '
+        f'{verdict(e3_series["24"], bold=False)} for 24.** The residual SD is at most '
+        f"{series_resid['6']:.2g} (6) and {series_resid['24']:.2g} (24) of each column's SD, "
+        f'against the {SMALL_RESIDUAL:.0%} criterion. The sample, with larger poses, is tested '
+        'under Center distance.'
+    )
+)
+```
+
 How large are the residuals next to the parameters? (MCFLIRT from AFNI, same y-axis per row.)
 
 ```{python}
@@ -474,7 +512,8 @@ for i, (name, pad) in enumerate(PADS.items()):
         fd = {c: f[PAIRS] for c, f in fd.items()}
     d = center_distance(img)
     rel = relative_parts(params, fd, PAIRS).abs()
-    reg = regression_summary(params).xs('24', level='parameters')
+    reg_all = regression_summary(params)
+    reg = reg_all.xs('24', level='parameters')
     sweep[name] = {
         'd (mm)': d,
         '√3·d/50': np.sqrt(3) * d / 50,
@@ -483,8 +522,10 @@ for i, (name, pad) in enumerate(PADS.items()):
         'rotation term': rel['rotation'].max(),
         '99th pct': rel['total'].quantile(0.99),
         'median': rel['total'].median(),
-        'min r2 (6)': regression_summary(params).xs('6', level='parameters')['min r2'].min(),
+        'min r2 (6)': reg_all.xs('6', level='parameters')['min r2'].min(),
         'min r2 (24)': reg['min r2'].min(),
+        'resid. SD (6)': reg_all.xs('6', level='parameters')['max rel. resid. SD'].max(),
+        'resid. SD (24)': reg['max rel. resid. SD'].max(),
         'worst 24 column': reg.loc[reg['min r2'].idxmin(), 'worst column'],
     }
     sweep_bounds[name] = bounds_table(fd, BAND)
@@ -533,23 +574,37 @@ def over_bound(column):
 
 
 over_total, over_translation = over_bound('max |rel. ΔFD|'), over_bound('translation term')
+near, far = sweep.iloc[0], sweep.iloc[-1]
+ref = sweep.loc['none']
+rot_max = sweep['rotation term'].max()
+e1_fd = rot_max < NEGLIGIBLE_FD
+e2 = not over_translation
 display(
     Markdown(
-        f'From d = {sweep["d (mm)"].min():.1f} to {sweep["d (mm)"].max():.1f} mm, the largest '
-        f'relative FD difference grows by {100 * slope:.2f}% per mm (linear fit; the analytic '
-        f'worst case is {100 * np.sqrt(3) / 50:.2f}% per mm). '
+        f'From d = {near["d (mm)"]:.1f} to {far["d (mm)"]:.1f} mm, the largest relative FD '
+        f'difference grows by {100 * slope:.2f}% per mm (linear fit; the analytic worst case '
+        f'is {100 * np.sqrt(3) / 50:.2f}% per mm).\n\n'
+        f'**Expectation 2: {verdict(e2, bold=False)} for the translation term**, which '
         + (
-            'The translation term stays under √3·d/50 at every distance. '
-            if not over_translation
-            else f'**The translation term exceeds √3·d/50 for {", ".join(over_translation)}.** '
+            'stays under √3·d/50 at every distance, at most '
+            f'{(sweep["translation term"] / sweep["√3·d/50"]).max():.0%} of it. '
+            if e2
+            else f'exceeds √3·d/50 for {", ".join(over_translation)}. '
         )
+        + 'Typical frames are smaller: the median is at most '
+        f'{(sweep["median"] / sweep["√3·d/50"]).max():.0%} of the bound. '
         + (
-            'So does the total.'
+            'The total FD difference also stays under the bound.'
             if not over_total
-            else f'**The total exceeds it for {", ".join(over_total)}**, because the '
-            f'rotation term, which the bound leaves out, adds up to '
-            f'{sweep["rotation term"].max():.1%} at any distance.'
+            else f'**The total exceeds the bound for {", ".join(over_total)}**, because of the '
+            'rotation term (Expectation 1).'
         )
+        + f'\n\n**Expectation 1, FD: {verdict(e1_fd, bold=False)}.** The rotation term, which differs '
+        f'only through Euler order, changes FD by up to {ref["rotation term"]:.1%} at '
+        f'd = {ref["d (mm)"]:.1f} mm and {rot_max:.1%} at worst, against the '
+        f'{NEGLIGIBLE_FD:.0%} criterion, whatever the center distance. At '
+        f'd = {near["d (mm)"]:.1f} mm it is {near["rotation term"]:.1%}, against the '
+        f"translation term's {near['translation term']:.1%}."
     )
 )
 ```
@@ -584,16 +639,27 @@ pose_sd = {
     name: (p['afni'][COLUMNS[:3]].std().mean(), np.rad2deg(p['afni'][ROTATIONS].std().mean()))
     for name, p in (('sample', sample_params), ('series', series_params))
 }
-far = sweep.iloc[-1]
+sd6_max = sweep['resid. SD (6)'].max()
+over24 = sweep[sweep['resid. SD (24)'] >= SMALL_RESIDUAL]
+e3_sample = {'6': sd6_max < SMALL_RESIDUAL, '24': over24.empty}
 display(
     Markdown(
-        f'With 6 parameters, r2 stays at or above {sweep["min r2 (6)"].min():.4f} at every '
-        f'distance. With 24, the lowest r2 falls from {sweep["min r2 (24)"].iloc[0]:.4f} at '
-        f'd = {sweep["d (mm)"].iloc[0]:.1f} mm to {far["min r2 (24)"]:.4f} at '
-        f'd = {far["d (mm)"]:.1f} mm, in `{far["worst 24 column"]}`. '
-        f"The sample's poses (SD {pose_sd['sample'][0]:.2f} mm, {pose_sd['sample'][1]:.2f}°) are "
-        f"larger than the series' ({pose_sd['series'][0]:.2f} mm, {pose_sd['series'][1]:.2f}°), "
-        'so its r2 is lower than in the Regression section at the same distance.'
+        f'**Expectation 3, sample: {verdict(e3_sample["6"], bold=False)} for 6 parameters, '
+        f'{verdict(e3_sample["24"], bold=False)} for 24.** With 6, the residual SD is at most '
+        f"{sd6_max:.2g} of the column's SD (r2 ≥ {sweep['min r2 (6)'].min():.4f}) at every "
+        'distance. '
+        + (
+            f'With 24, it is at most {sweep["resid. SD (24)"].max():.2g}.'
+            if e3_sample['24']
+            else f'With 24, it reaches the {SMALL_RESIDUAL:.0%} criterion at {len(over24)} of '
+            f'{len(sweep)} distances, from d = {over24["d (mm)"].min():.1f} mm, and '
+            f'{far["resid. SD (24)"]:.2f} (r2 {far["min r2 (24)"]:.2f}, '
+            f'`{far["worst 24 column"]}`) at d = {far["d (mm)"]:.1f} mm.'
+        )
+        + f" The sample's poses (SD {pose_sd['sample'][0]:.2f} mm, {pose_sd['sample'][1]:.2f}°) "
+        f"are larger than the series' ({pose_sd['series'][0]:.2f} mm, "
+        f'{pose_sd["series"][1]:.2f}°), so its residuals are larger than in the Regression '
+        'section at the same distance.'
     )
 )
 ```
@@ -635,11 +701,7 @@ for tau, row in sample_bounds.iterrows():
         f'| {tau:g} | {high:.3f} ({high / tau - 1:+.1%}) | {low:.3f} ({low / tau - 1:+.1%}) '
         f'| {pct_range(row.filter(like="P(disagree)"))} |'
     )
-reg6 = series_regression.xs('6', level='parameters')
-reg24 = series_regression.xs('24', level='parameters')
-ref = sweep.loc['none']
 p_range = sweep_bounds.filter(like='P(disagree)').stack()
-near, far = sweep.iloc[0], sweep.iloc[-1]
 
 summary.update(
     Markdown(
@@ -654,35 +716,44 @@ summary.update(
                 *rows,
                 '',
                 f'- **Relative FD difference** at d = {d_ref:.1f} mm: at most '
-                f'{ref["max |rel. ΔFD|"]:.1%}, median {ref["median"]:.1%}. The analytic worst '
-                f'case √3·d/50 is {ref["√3·d/50"]:.1%}.',
+                f'{ref["max |rel. ΔFD|"]:.1%}, median {ref["median"]:.1%}.',
                 f'- **Center distance**, from {near["d (mm)"]:.1f} to {far["d (mm)"]:.1f} mm: the '
-                f'largest relative difference grows by {100 * slope:.2f}% per mm (analytic '
-                f'worst case {100 * np.sqrt(3) / 50:.2f}% per mm), to {far["max |rel. ΔFD|"]:.0%}. '
-                'The translation term '
-                + (
-                    'stays under √3·d/50 throughout. '
-                    if not over_translation
-                    else f'**exceeds √3·d/50 for {", ".join(over_translation)}**. '
-                )
-                + (
-                    'So does the total.'
-                    if not over_total
-                    else f'**The total exceeds it for {", ".join(over_total)}**: the rotation '
-                    f'term (Euler order) adds up to {sweep["rotation term"].max():.1%} of FD at '
-                    'any distance, which the bound leaves out.'
-                ),
-                f'- **Disagreement** within ±{BAND:.0%} of τ: {pct_range(p_range)} of frames '
-                f'across distances and thresholds, from {pct_range(sweep_bounds.loc[near.name].filter(like="P(disagree)").stack())} '
-                f'at d = {near["d (mm)"]:.1f} mm to {pct_range(sweep_bounds.loc[far.name].filter(like="P(disagree)").stack())} '
-                f'at d = {far["d (mm)"]:.1f} mm.',
+                f'largest relative difference grows by {100 * slope:.2f}% per mm, to '
+                f'{far["max |rel. ΔFD|"]:.0%}. Disagreement within ±{BAND:.0%} of τ ranges '
+                f'{pct_range(p_range)}, from '
+                f'{pct_range(sweep_bounds.loc[near.name].filter(like="P(disagree)").stack())} at '
+                f'{near["d (mm)"]:.1f} mm to '
+                f'{pct_range(sweep_bounds.loc[far.name].filter(like="P(disagree)").stack())} at '
+                f'{far["d (mm)"]:.1f} mm.',
                 f'- **3dvolreg series:** {len(flagged)} of {len(series_fd["afni"]) - 1} frames '
                 'are censored by one convention only, at any threshold.',
-                f'- **Regression**, series, both directions: r2 {reg6["min r2"].min():.6f} or more '
-                f'for 6 parameters, {reg24["min r2"].min():.4f} or more for 24. In the sample, '
-                f'6-parameter r2 stays at or above {sweep["min r2 (6)"].min():.4f} at every '
-                f'distance, but the 24-parameter r2 falls to {far["min r2 (24)"]:.2f} at '
-                f'd = {far["d (mm)"]:.1f} mm (`{far["worst 24 column"]}`).',
+                f'- **Expectation 1** (Euler order is negligible): {verdict(e1_params)} for the '
+                f'parameters (at most {np.rad2deg(max_rot_diff):.2g}°); {verdict(e1_fd)} for FD, '
+                f'which it changes by up to {ref["rotation term"]:.1%} at '
+                f'd = {ref["d (mm)"]:.1f} mm and {rot_max:.1%} at worst.',
+                f'- **Expectation 2** (√3·d/50 bounds the change): {verdict(e2)} for the '
+                'translation term'
+                + (
+                    ' at every distance'
+                    if e2
+                    else f', which exceeds it for {", ".join(over_translation)}'
+                )
+                + (
+                    '; the total stays under it too.'
+                    if not over_total
+                    else f'; the total exceeds it for {", ".join(over_total)}, because of '
+                    'Euler order.'
+                ),
+                f'- **Expectation 3** (regression leaves little): for 6 parameters, '
+                f'{verdict(e3_series["6"] and e3_sample["6"])} (residual SD at most '
+                f'{max(series_resid["6"], sd6_max):.2g}); for 24, {verdict(e3_series["24"])} on '
+                f'the series ({series_resid["24"]:.2g}) and {verdict(e3_sample["24"])} in the '
+                + (
+                    f'sample ({sweep["resid. SD (24)"].max():.2g}).'
+                    if e3_sample['24']
+                    else f'sample from d = {over24["d (mm)"].min():.1f} mm, reaching '
+                    f'{far["resid. SD (24)"]:.2f} at d = {far["d (mm)"]:.1f} mm.'
+                ),
             ]
         )
     )
