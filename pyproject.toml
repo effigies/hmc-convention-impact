@@ -14,6 +14,7 @@ dev = [
     "matplotlib>=3.11.2",
     "niworkflows",
     "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.3",
     "typer>=0.27.3",
 ]
@@ -31,3 +32,4 @@ quote-style = 'single'
 [tool.pytest.ini_options]
 testpaths = ['tests']
 pythonpath = ['.']
+addopts = ['--cov=hmc_impact', '--cov=tests', '--cov-report=term-missing']
