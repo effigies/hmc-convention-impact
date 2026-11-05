@@ -10,7 +10,18 @@ The analysis lives in the notebook `motion-convention-impact.Rmd` (Jupytext).
 uv run jupyter-lab
 ```
 
-Open `motion-convention-impact.Rmd`.
+Open `motion-convention-impact.Rmd`. The bundled Jupytext extension registers `.Rmd` as a
+notebook; if it opens as text, right-click it and choose **Open With → Jupytext Notebook**.
+
+## Save an executed notebook
+
+```bash
+uv run jupytext --to ipynb --execute --run-path . motion-convention-impact.Rmd
+```
+
+This writes `motion-convention-impact.ipynb` with all outputs, in under 2 minutes.
+`--run-path .` runs the kernel in the repository root, where it finds `hmc_impact` and `data/`.
+The `.ipynb` is not committed.
 
 ## Regenerate `data/`
 
@@ -25,3 +36,5 @@ PATH="<dir with 3dvolreg>:$PATH" uv run python -m scripts.generate_volreg
 ```bash
 uv run pytest
 ```
+
+This reports coverage of `hmc_impact` and `tests`.
