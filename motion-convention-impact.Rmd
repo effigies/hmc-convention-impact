@@ -1,0 +1,690 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.19.6
+  kernelspec:
+    display_name: Python 3 (ipykernel)
+    language: python
+    name: python3
+---
+
+# How much do the head-motion conventions change FD?
+
+fMRIPrep reports MCFLIRT's and 3dvolreg's motion parameters on RAS+ axes, but each keeps its tool's rotation center and Euler order.
+So identical motion gives different parameters, and possibly different FD and censoring.
+This notebook measures the gap, to help choose between **preserving tool values** and **consistent determinations** (identical motion gives identical FD, whichever `--hmc` tool ran).
+
+## Summary
+
+```{python}
+from IPython.display import Markdown, display
+
+summary = display(Markdown('_Run the notebook to fill in the summary._'), display_id='summary')
+```
+
+## Setup
+
+```{python}
+import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import fmriprep
+import matplotlib.pyplot as plt
+import nibabel as nb
+import nitransforms as nt
+import niworkflows
+import numpy as np
+import pandas as pd
+from fmriprep.interfaces.nitransforms import VolregToITK
+from fmriprep.utils.transforms import volreg_to_ras
+from nipype.pipeline.engine import Node
+
+from hmc_impact.analysis import (
+    COLUMNS,
+    censor_counts,
+    disagreement,
+    expand24,
+    regress_out,
+    threshold_bounds,
+)
+from hmc_impact.conventions import (
+    center_distance,
+    framewise_displacement,
+    motion_params,
+    pad_image,
+    rms_displacement,
+    to_volreg_1d,
+)
+from hmc_impact.motion import THRESHOLDS, near_threshold_sides, sample_fd_targets, simulate_pairs
+
+# niworkflows selects matplotlib's Agg backend on import; restore inline figures
+# %matplotlib inline
+logging.getLogger('nipype.workflow').setLevel(logging.WARNING)
+
+CONVENTIONS = ('afni', 'fsl')
+LABEL = {'afni': 'AFNI', 'fsl': 'MCFLIRT'}
+COLOR = {'afni': 'tab:blue', 'fsl': 'tab:orange'}
+ROTATIONS = ['rot_x', 'rot_y', 'rot_z']
+
+_tmp = TemporaryDirectory()
+WORK = Path(_tmp.name)
+
+display(
+    Markdown(
+        f'fMRIPrep `{fmriprep.__version__}`, niworkflows `{niworkflows.__version__}`. '
+        f'FD thresholds: {", ".join(f"{t:g}" for t in THRESHOLDS)} mm.'
+    )
+)
+```
+
+```{python}
+def convert(xfms, img, tag):
+    """AFNI and MCFLIRT parameters (mm, rad) and FD for RAS affines expressed on ``img``."""
+    params = {c: motion_params(xfms, img, c, WORK / f'{tag}_{c}') for c in CONVENTIONS}
+    fd = {c: framewise_displacement(params[c], WORK / f'{tag}_{c}') for c in CONVENTIONS}
+    return params, fd
+
+
+def bounds_table(fd, band):
+    """Per threshold: each convention's FD bounded by the other's decision, and disagreement."""
+    rows = {}
+    for tau in THRESHOLDS:
+        row = {}
+        for a, b in (('afni', 'fsl'), ('fsl', 'afni')):
+            high, low = threshold_bounds(fd[a], fd[b], tau)
+            p, n = disagreement(fd[a], fd[b], tau, band)
+            row[f'max {LABEL[b]} | {LABEL[a]} ≤ τ'] = high
+            row[f'min {LABEL[b]} | {LABEL[a]} > τ'] = low
+            row[f'P(disagree) | {LABEL[a]} near τ'] = p
+            row[f'n | {LABEL[a]} near τ'] = n
+        rows[tau] = row
+    return pd.DataFrame.from_dict(rows, orient='index').rename_axis('τ (mm)')
+
+
+def regression_summary(params):
+    """r2 range and worst relative residual SD, regressing each convention out of the other."""
+    rows = {}
+    for a, b in (('afni', 'fsl'), ('fsl', 'afni')):
+        for model, expand in (('6', lambda p: p[COLUMNS]), ('24', expand24)):
+            _, s = regress_out(expand(params[b]), expand(params[a]))
+            rows[(f'{LABEL[b]} from {LABEL[a]}', model)] = {
+                'min r2': s.r2.min(),
+                'max r2': s.r2.max(),
+                'max rel. resid. SD': s.rel_resid_sd.max(),
+                'worst column': s.r2.idxmin(),
+            }
+    return pd.DataFrame.from_dict(rows, orient='index').rename_axis(['target', 'parameters'])
+
+
+def rotation_term(params):
+    """FD's rotation term, 50 mm × sum of absolute frame-to-frame rotation changes; NaN at 0."""
+    steps = np.abs(np.diff(params[ROTATIONS].to_numpy(), axis=0)).sum(axis=1)
+    return np.r_[np.nan, 50 * steps]
+
+
+def relative_parts(params, fd, step=slice(None)):
+    """(MCFLIRT − AFNI) / AFNI FD: total, and the parts from the rotation and translation terms."""
+    rot = {c: rotation_term(params[c])[step] for c in CONVENTIONS}
+    total = (fd['fsl'] - fd['afni']) / fd['afni']
+    rotation = (rot['fsl'] - rot['afni']) / fd['afni']
+    return pd.DataFrame({'total': total, 'rotation': rotation, 'translation': total - rotation})
+
+
+def pct_range(values):
+    lo, hi = f'{min(values):.0%}', f'{max(values):.0%}'
+    return lo if lo == hi else f'{lo}–{hi}'
+
+
+def to_display_units(params):
+    """Copy of ``params`` with rotations in degrees."""
+    out = params[COLUMNS].copy()
+    out[ROTATIONS] = np.rad2deg(out[ROTATIONS])
+    return out
+
+
+def threshold_lines(ax, vertical=False):
+    for tau in THRESHOLDS:
+        ax.axhline(tau, color='0.6', lw=0.8, ls=':')
+        if vertical:
+            ax.axvline(tau, color='0.6', lw=0.8, ls=':')
+```
+
+## Conventions
+
+The same rigid transform can be written as six parameters in more than one way:
+
+- **AFNI** (`AFNIMotionParams`): rotations about the center of the de-obliqued grid, composed `Ry @ Rx @ Rz` in AFNI's axes.
+- **MCFLIRT** (`FSLMotionParams`): translations of the reference's center of gravity, rotations composed `Rx @ Ry @ Rz` in FSL's axes.
+
+FD adds the absolute frame-to-frame changes of all six, with rotations as arc length on a 50 mm sphere.
+If the conventions' differences change FD by more than a threshold's margin, the same frame is kept under one and censored under the other.
+
+**Expectations to test.** These are expectations, not findings; the sections below check them.
+
+1. Euler order alone changes the rotations by about the product of two angles: negligible.
+2. Moving the rotation center by `d` adds about `Δω × d` to each frame-to-frame translation.
+   FD's rotation term is at least `50·|Δω|`, so the relative FD change should stay under about `√3·d/50`: 3.5% per mm of center distance in the worst case, less in typical frames.
+3. That shift is linear in the rotations, so each parameter set should be nearly a linear combination of the other, and regressing one out of the other should leave little.
+
+## The 3dvolreg series
+
+`data/` holds one 3dvolreg (AFNI_26.3.09, `-cubic -zpad 1`) registration of a 200-volume synthetic series, made by `scripts/generate_volreg.py`.
+`VolregToITK` turns its parameters into transforms and cross-checks them against the saved matrices.
+
+```{python}
+DATA = Path('data').resolve()
+boldref = nb.load(DATA / 'boldref.nii.gz')
+volreg_1d = np.loadtxt(DATA / 'volreg.1D')
+
+itk = (
+    Node(
+        VolregToITK(
+            in_params=str(DATA / 'volreg.1D'),
+            in_matrices=str(DATA / 'volreg.aff12.1D'),
+            reference=str(DATA / 'boldref.nii.gz'),
+        ),
+        name='volreg_to_itk',
+        base_dir=str(WORK),
+    )
+    .run()
+    .outputs.out_file
+)
+series_xfms = nt.linear.load(itk).matrix
+series_params, series_fd = convert(series_xfms, boldref, 'series')
+
+roundtrip = np.abs(to_volreg_1d(series_params['afni']) - volreg_1d).max()
+assert roundtrip < 1e-5, roundtrip
+d_ref = center_distance(boldref)
+
+display(
+    Markdown(
+        f'`AFNIMotionParams` reproduces `volreg.1D` to within {roundtrip:.1g} (degrees and mm), '
+        'so the differences below come from the conventions, not the conversion. '
+        f'The reference grid center and center of gravity are {d_ref:.1f} mm apart.'
+    )
+)
+```
+
+The script required frames just below and just above each threshold (within 15%). The check, repeated on both FDs:
+
+```{python}
+sides = pd.DataFrame(
+    {
+        (LABEL[c], side): {tau: hit[i] for tau, hit in near_threshold_sides(series_fd[c]).items()}
+        for c in CONVENTIONS
+        for i, side in enumerate(('below', 'above'))
+    }
+).rename_axis('τ (mm)')
+assert sides['AFNI'].all(axis=None)
+sides
+```
+
+## Parameters
+
+How far apart are the two parameter sets over the series?
+
+```{python}
+fig, axes = plt.subplots(2, 3, figsize=(11, 5), sharex=True, layout='constrained')
+shown = {c: to_display_units(series_params[c]) for c in CONVENTIONS}
+for ax, col in zip(axes.flat, COLUMNS):
+    for c in CONVENTIONS:
+        ax.plot(shown[c][col], color=COLOR[c], lw=1, label=LABEL[c])
+    ax.set_title(col)
+axes[0, 0].set_ylabel('mm')
+axes[1, 0].set_ylabel('degrees')
+axes[0, 0].legend(frameon=False)
+for ax in axes[1]:
+    ax.set_xlabel('volume')
+plt.show()
+```
+
+The differences (MCFLIRT − AFNI), on their own scale:
+
+```{python}
+diff = shown['fsl'] - shown['afni']
+fig, axes = plt.subplots(2, 3, figsize=(11, 5), sharex=True, layout='constrained')
+for ax, col in zip(axes.flat, COLUMNS):
+    ax.plot(diff[col], color='0.2', lw=1)
+    ax.set_title(col)
+axes[0, 0].set_ylabel('mm')
+axes[1, 0].set_ylabel('degrees')
+for ax in axes[1]:
+    ax.set_xlabel('volume')
+plt.show()
+```
+
+```{python}
+# Expectation 1: compare rotation differences with the largest product of two angles in a frame
+angles = series_params['afni'][ROTATIONS].abs().to_numpy()
+pair_products = np.sort(angles, axis=1)[:, 1:].prod(axis=1)
+rot_diff = (series_params['fsl'][ROTATIONS] - series_params['afni'][ROTATIONS]).abs().to_numpy()
+max_rot_diff = rot_diff.max()
+max_product = pair_products.max()
+max_trans_diff = diff[COLUMNS[:3]].abs().to_numpy().max()
+
+display(
+    Markdown(
+        f'The rotations differ by at most {np.rad2deg(max_rot_diff):.2g}°; the largest product '
+        f'of two angles in any frame is {np.rad2deg(max_product):.2g}°. '
+        f"On FD's 50 mm sphere, that rotation difference is at most {50 * max_rot_diff:.2g} mm. "
+        f'The translations differ by up to {max_trans_diff:.2f} mm, because the rotation '
+        'centers differ.'
+    )
+)
+```
+
+## FD and censoring
+
+Do the two FD traces visibly differ?
+
+```{python}
+fig, ax = plt.subplots(figsize=(11, 3), layout='constrained')
+for c in CONVENTIONS:
+    ax.plot(series_fd[c], color=COLOR[c], lw=1, label=LABEL[c])
+threshold_lines(ax)
+ax.set(xlabel='volume', ylabel='FD (mm)')
+ax.legend(frameon=False)
+plt.show()
+```
+
+Which frames fall on different sides of a threshold?
+
+```{python}
+discordant = {
+    tau: np.flatnonzero((series_fd['afni'] > tau) != (series_fd['fsl'] > tau))
+    for tau in THRESHOLDS
+}
+flagged = np.unique(np.concatenate(list(discordant.values())))
+
+fig, ax = plt.subplots(figsize=(5, 5), layout='constrained')
+ax.scatter(series_fd['afni'], series_fd['fsl'], s=10, color='0.5', label='frames')
+ax.scatter(
+    series_fd['afni'][flagged],
+    series_fd['fsl'][flagged],
+    s=40,
+    facecolor='none',
+    edgecolor='k',
+    label=f'censored by one only ({len(flagged)})',
+)
+lim = np.nanmax(list(series_fd.values())) * 1.05
+ax.plot([0, lim], [0, lim], color='0.8', lw=0.8, zorder=0)
+threshold_lines(ax, vertical=True)
+ax.set(xlabel='AFNI FD (mm)', ylabel='MCFLIRT FD (mm)', xlim=(0, lim), ylim=(0, lim))
+ax.legend(frameon=False, loc='upper left')
+plt.show()
+```
+
+```{python}
+counts = pd.DataFrame(
+    {tau: censor_counts(series_fd['afni'], series_fd['fsl'], tau) for tau in THRESHOLDS}
+).T.rename(columns={'a_only': 'AFNI only', 'b_only': 'MCFLIRT only'})
+counts['discordant frames'] = [', '.join(map(str, discordant[tau])) or '–' for tau in THRESHOLDS]
+counts.rename_axis('τ (mm)')
+```
+
+## Threshold error
+
+The series has too few frames near each threshold for stable bounds.
+The bounds come instead from 10,000 independent frame pairs drawn from the same motion model, half of them within 15% of a threshold.
+Their transforms go through the same interfaces; 3dvolreg is not rerun.
+`BAND` sets the disagreement window, ±10% of τ.
+
+```{python}
+BAND = 0.1
+
+rng = np.random.default_rng(1)
+pairs = simulate_pairs(sample_fd_targets(10_000, rng), rng)
+sample_xfms = volreg_to_ras(pairs, boldref)
+sample_params, sample_fd = convert(sample_xfms, boldref, 'sample')
+sample_fd = {c: fd[1::2] for c, fd in sample_fd.items()}  # FD within each pair
+
+sample_bounds = bounds_table(sample_fd, BAND)
+(
+    sample_bounds.style.format(precision=3)
+    .format('{:d}', subset=sample_bounds.filter(like='n |').columns)
+    .format_index('{:g}')
+)
+```
+
+```{python}
+lines = []
+for tau, row in sample_bounds.iterrows():
+    high = max(row['max MCFLIRT | AFNI ≤ τ'], row['max AFNI | MCFLIRT ≤ τ'])
+    low = min(row['min MCFLIRT | AFNI > τ'], row['min AFNI | MCFLIRT > τ'])
+    p = row.filter(like='P(disagree)')
+    lines.append(
+        f'- τ = {tau:g} mm: a frame kept by one convention measures up to {high:.3f} mm '
+        f'under the other; a frame censored by one measures as low as {low:.3f} mm. '
+        f'Within ±{BAND:.0%} of τ, {pct_range(p)} of frames are censored '
+        'by one convention only.'
+    )
+display(Markdown('\n'.join(lines)))
+```
+
+How large is the relative FD difference, compared with the `√3·d/50` worst case?
+
+```{python}
+PAIRS = slice(1, None, 2)  # rows of rotation_term() within each pair
+parts = relative_parts(sample_params, sample_fd, PAIRS)
+analytic = np.sqrt(3) * d_ref / 50
+
+fig, ax = plt.subplots(figsize=(8, 4), layout='constrained')
+ax.scatter(sample_fd['afni'], 100 * parts['total'], s=2, color='0.4', alpha=0.3, lw=0)
+for sign in (1, -1):
+    ax.axhline(sign * 100 * analytic, color='k', lw=1, ls='--')
+ax.text(1.5, 100 * analytic, f'±√3·d/50, d = {d_ref:.1f} mm', va='bottom', ha='right')
+for tau in THRESHOLDS:
+    ax.axvline(tau, color='0.6', lw=0.8, ls=':')
+ax.set(xlabel='AFNI FD (mm)', ylabel='(MCFLIRT − AFNI) / AFNI FD (%)')
+plt.show()
+
+worst = parts.abs().max()
+display(
+    Markdown(
+        f'Largest relative difference: {worst["total"]:.1%}; 99th percentile '
+        f'{parts["total"].abs().quantile(0.99):.1%}; median {parts["total"].abs().median():.1%}. '
+        f'The analytic worst case at d = {d_ref:.1f} mm is {analytic:.1%}, which the sample '
+        + ('respects. ' if worst['total'] <= analytic else '**exceeds**. ')
+        + 'Split by FD term: the translation term, which the bound describes, differs by up to '
+        f'{worst["translation"]:.1%} of FD; the rotation term, which differs only through '
+        f'Euler order, by up to {worst["rotation"]:.1%}.'
+    )
+)
+```
+
+Do the 3dvolreg series' FD pairs fall within the sample's bounds?
+
+```{python}
+series_bounds = bounds_table(series_fd, BAND)
+highs = sample_bounds.filter(like='max').columns
+lows = sample_bounds.filter(like='min').columns
+within = pd.concat(
+    [series_bounds[highs] <= sample_bounds[highs], series_bounds[lows] >= sample_bounds[lows]],
+    axis=1,
+)
+assert within.all(axis=None), within
+display(
+    Markdown(
+        f"All {within.size} series bounds lie within the sample's: "
+        'the sample covers what the real registration produced.'
+    )
+)
+pd.concat(
+    {'series': series_bounds[[*highs, *lows]], 'sample': sample_bounds[[*highs, *lows]]}
+).round(3)
+```
+
+## Regression
+
+How much of each parameter set is left after regressing out the other?
+
+```{python}
+series_regression = regression_summary(series_params)
+series_regression.style.format('{:.6f}', subset=['min r2', 'max r2']).format(
+    '{:.2g}', subset=['max rel. resid. SD']
+)
+```
+
+How large are the residuals next to the parameters? (MCFLIRT from AFNI, same y-axis per row.)
+
+```{python}
+resid6, _ = regress_out(series_params['fsl'][COLUMNS], series_params['afni'][COLUMNS])
+resid24, _ = regress_out(expand24(series_params['fsl']), expand24(series_params['afni']))
+resid = {'6': to_display_units(resid6), '24': to_display_units(resid24[COLUMNS])}
+
+fig, axes = plt.subplots(2, 3, figsize=(11, 5), sharex=True, sharey='row', layout='constrained')
+for ax, col in zip(axes.flat, COLUMNS):
+    ax.plot(shown['fsl'][col], color=COLOR['fsl'], lw=1, label='MCFLIRT parameter')
+    ax.plot(resid['6'][col], color='k', lw=1, label='residual, 6 regressors')
+    ax.plot(resid['24'][col], color='0.5', lw=1, ls='--', label='residual, 24 regressors')
+    ax.set_title(col)
+axes[0, 0].set_ylabel('mm')
+axes[1, 0].set_ylabel('degrees')
+axes[0, 0].legend(frameon=False, fontsize='small')
+for ax in axes[1]:
+    ax.set_xlabel('volume')
+plt.show()
+```
+
+## Center distance
+
+The sample transforms are re-expressed on padded copies of the reference (re-parameterized, not re-registered).
+Padding with the image minimum moves the grid center, and with it AFNI's rotation center, but leaves the center of gravity in place.
+
+```{python}
+PADS = {
+    'none': [(0, 0), (0, 0), (0, 0)],
+    **{f'axis 0 +{p}': [(p, 0), (0, 0), (0, 0)] for p in (5, 10, 20)},
+    **{f'axis 1 +{p}': [(0, 0), (p, 0), (0, 0)] for p in (5, 10, 20)},
+    'diagonal (10, 10, 5)': [(10, 0), (10, 0), (5, 0)],
+}
+
+sweep, sweep_bounds = {}, {}
+for i, (name, pad) in enumerate(PADS.items()):
+    if name == 'none':
+        img, params, fd = boldref, sample_params, sample_fd
+    else:
+        img = pad_image(boldref, pad)
+        params, fd = convert(sample_xfms, img, f'pad{i}')
+        fd = {c: f[PAIRS] for c, f in fd.items()}
+    d = center_distance(img)
+    rel = relative_parts(params, fd, PAIRS).abs()
+    reg = regression_summary(params).xs('24', level='parameters')
+    sweep[name] = {
+        'd (mm)': d,
+        '√3·d/50': np.sqrt(3) * d / 50,
+        'max |rel. ΔFD|': rel['total'].max(),
+        'translation term': rel['translation'].max(),
+        'rotation term': rel['rotation'].max(),
+        '99th pct': rel['total'].quantile(0.99),
+        'median': rel['total'].median(),
+        'min r2 (6)': regression_summary(params).xs('6', level='parameters')['min r2'].min(),
+        'min r2 (24)': reg['min r2'].min(),
+        'worst 24 column': reg.loc[reg['min r2'].idxmin(), 'worst column'],
+    }
+    sweep_bounds[name] = bounds_table(fd, BAND)
+
+sweep = pd.DataFrame.from_dict(sweep, orient='index').sort_values('d (mm)')
+sweep_bounds = pd.concat(sweep_bounds, names=['pad'])
+sweep.style.format(precision=3).format('{:.1f}', subset=['d (mm)']).format(
+    '{:.4f}', subset=['min r2 (6)', 'min r2 (24)']
+)
+```
+
+The bounds and disagreement per threshold, for each padding:
+
+```{python}
+sweep_bounds.loc[sweep.index].drop(columns=sweep_bounds.filter(like='n |').columns).round(3)
+```
+
+Does the worst-case relative FD difference grow with center distance as the analytic bound says?
+
+```{python}
+slope = np.polyfit(sweep['d (mm)'], sweep['max |rel. ΔFD|'], 1)[0]
+d_grid = np.linspace(0, sweep['d (mm)'].max() * 1.05, 2)
+
+fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
+ax.plot(d_grid, 100 * np.sqrt(3) * d_grid / 50, color='k', ls='--', lw=1, label='√3·d/50')
+ax.plot(sweep['d (mm)'], 100 * sweep['max |rel. ΔFD|'], 'o', color='k', label='max, total')
+ax.plot(
+    sweep['d (mm)'], 100 * sweep['translation term'], 'x', color='k', label='max, translation term'
+)
+ax.plot(
+    sweep['d (mm)'], 100 * sweep['rotation term'], 'd', color='0.6', label='max, rotation term'
+)
+ax.plot(
+    sweep['d (mm)'], 100 * sweep['99th pct'], 's', color='0.4', mfc='none', label='99th percentile'
+)
+ax.plot(sweep['d (mm)'], 100 * sweep['median'], '^', color='0.4', mfc='none', label='median')
+ax.set(xlabel='grid center to center of gravity (mm)', ylabel='|relative FD difference| (%)')
+ax.legend(frameon=False, fontsize='small')
+plt.show()
+
+
+def over_bound(column):
+    """Paddings, with distances, where ``column`` exceeds √3·d/50."""
+    over = sweep[sweep[column] > sweep['√3·d/50']]
+    return [f'{name} (d = {d:.1f} mm)' for name, d in over['d (mm)'].items()]
+
+
+over_total, over_translation = over_bound('max |rel. ΔFD|'), over_bound('translation term')
+display(
+    Markdown(
+        f'From d = {sweep["d (mm)"].min():.1f} to {sweep["d (mm)"].max():.1f} mm, the largest '
+        f'relative FD difference grows by {100 * slope:.2f}% per mm (linear fit; the analytic '
+        f'worst case is {100 * np.sqrt(3) / 50:.2f}% per mm). '
+        + (
+            'The translation term stays under √3·d/50 at every distance. '
+            if not over_translation
+            else f'**The translation term exceeds √3·d/50 for {", ".join(over_translation)}.** '
+        )
+        + (
+            'So does the total.'
+            if not over_total
+            else f'**The total exceeds it for {", ".join(over_total)}**, because the '
+            f'rotation term, which the bound leaves out, adds up to '
+            f'{sweep["rotation term"].max():.1%} at any distance.'
+        )
+    )
+)
+```
+
+How often do the conventions disagree near a threshold as center distance grows?
+
+```{python}
+p_afni = sweep_bounds['P(disagree) | AFNI near τ'].unstack('τ (mm)').loc[sweep.index]
+fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
+for tau, marker in zip(THRESHOLDS, 'os^'):
+    ax.plot(
+        sweep['d (mm)'],
+        100 * p_afni[tau],
+        marker=marker,
+        color='k',
+        lw=0.8,
+        label=f'τ = {tau:g} mm',
+    )
+ax.set(
+    xlabel='grid center to center of gravity (mm)',
+    ylabel=f'censored by one only, AFNI FD within ±{BAND:.0%} of τ (%)',
+    ylim=(0, None),
+)
+ax.legend(frameon=False)
+plt.show()
+```
+
+Does regression still remove one convention from the other as center distance grows?
+
+```{python}
+pose_sd = {
+    name: (p['afni'][COLUMNS[:3]].std().mean(), np.rad2deg(p['afni'][ROTATIONS].std().mean()))
+    for name, p in (('sample', sample_params), ('series', series_params))
+}
+far = sweep.iloc[-1]
+display(
+    Markdown(
+        f'With 6 parameters, r2 stays at or above {sweep["min r2 (6)"].min():.4f} at every '
+        f'distance. With 24, the lowest r2 falls from {sweep["min r2 (24)"].iloc[0]:.4f} at '
+        f'd = {sweep["d (mm)"].iloc[0]:.1f} mm to {far["min r2 (24)"]:.4f} at '
+        f'd = {far["d (mm)"]:.1f} mm, in `{far["worst 24 column"]}`. '
+        f"The sample's poses (SD {pose_sd['sample'][0]:.2f} mm, {pose_sd['sample'][1]:.2f}°) are "
+        f"larger than the series' ({pose_sd['series'][0]:.2f} mm, {pose_sd['series'][1]:.2f}°), "
+        'so its r2 is lower than in the Regression section at the same distance.'
+    )
+)
+```
+
+## Yardstick
+
+RMS displacement of brain voxels between frames belongs to neither convention.
+How closely does each FD follow it?
+
+```{python}
+rms = rms_displacement(series_xfms, boldref)
+
+fig, ax = plt.subplots(figsize=(5, 5), layout='constrained')
+for c in CONVENTIONS:
+    ax.scatter(rms, series_fd[c], s=10, color=COLOR[c], alpha=0.7, label=LABEL[c])
+ax.set(xlabel='RMS brain-voxel displacement (mm)', ylabel='FD (mm)')
+ax.legend(frameon=False)
+plt.show()
+
+r = {c: np.corrcoef(rms[1:], series_fd[c][1:])[0, 1] for c in CONVENTIONS}
+gap = np.abs(series_fd['fsl'] - series_fd['afni'])[1:]
+display(
+    Markdown(
+        f'Correlation with RMS displacement: AFNI FD r = {r["afni"]:.3f}, '
+        f'MCFLIRT FD r = {r["fsl"]:.3f}. '
+        f'The FD gap is at most {gap.max():.3f} mm; RMS displacement ranges from '
+        f'{np.nanmin(rms):.3f} to {np.nanmax(rms):.3f} mm.'
+    )
+)
+```
+
+```{python}
+# Fill in the summary at the top
+rows = []
+for tau, row in sample_bounds.iterrows():
+    high = max(row['max MCFLIRT | AFNI ≤ τ'], row['max AFNI | MCFLIRT ≤ τ'])
+    low = min(row['min MCFLIRT | AFNI > τ'], row['min AFNI | MCFLIRT > τ'])
+    rows.append(
+        f'| {tau:g} | {high:.3f} ({high / tau - 1:+.1%}) | {low:.3f} ({low / tau - 1:+.1%}) '
+        f'| {pct_range(row.filter(like="P(disagree)"))} |'
+    )
+reg6 = series_regression.xs('6', level='parameters')
+reg24 = series_regression.xs('24', level='parameters')
+ref = sweep.loc['none']
+p_range = sweep_bounds.filter(like='P(disagree)').stack()
+near, far = sweep.iloc[0], sweep.iloc[-1]
+
+summary.update(
+    Markdown(
+        '\n'.join(
+            [
+                'Worst case over both directions, from 10,000 simulated frame pairs on the '
+                f'reference grid (center distance d = {d_ref:.1f} mm):',
+                '',
+                '| τ (mm) | kept by one; the other measures up to | censored by one; the other '
+                f'measures as low as | censored by one only, within ±{BAND:.0%} of τ |',
+                '| --- | --- | --- | --- |',
+                *rows,
+                '',
+                f'- **Relative FD difference** at d = {d_ref:.1f} mm: at most '
+                f'{ref["max |rel. ΔFD|"]:.1%}, median {ref["median"]:.1%}. The analytic worst '
+                f'case √3·d/50 is {ref["√3·d/50"]:.1%}.',
+                f'- **Center distance**, from {near["d (mm)"]:.1f} to {far["d (mm)"]:.1f} mm: the '
+                f'largest relative difference grows by {100 * slope:.2f}% per mm (analytic '
+                f'worst case {100 * np.sqrt(3) / 50:.2f}% per mm), to {far["max |rel. ΔFD|"]:.0%}. '
+                'The translation term '
+                + (
+                    'stays under √3·d/50 throughout. '
+                    if not over_translation
+                    else f'**exceeds √3·d/50 for {", ".join(over_translation)}**. '
+                )
+                + (
+                    'So does the total.'
+                    if not over_total
+                    else f'**The total exceeds it for {", ".join(over_total)}**: the rotation '
+                    f'term (Euler order) adds up to {sweep["rotation term"].max():.1%} of FD at '
+                    'any distance, which the bound leaves out.'
+                ),
+                f'- **Disagreement** within ±{BAND:.0%} of τ: {pct_range(p_range)} of frames '
+                f'across distances and thresholds, from {pct_range(sweep_bounds.loc[near.name].filter(like="P(disagree)").stack())} '
+                f'at d = {near["d (mm)"]:.1f} mm to {pct_range(sweep_bounds.loc[far.name].filter(like="P(disagree)").stack())} '
+                f'at d = {far["d (mm)"]:.1f} mm.',
+                f'- **3dvolreg series:** {len(flagged)} of {len(series_fd["afni"]) - 1} frames '
+                'are censored by one convention only, at any threshold.',
+                f'- **Regression**, series, both directions: r2 {reg6["min r2"].min():.6f} or more '
+                f'for 6 parameters, {reg24["min r2"].min():.4f} or more for 24. In the sample, '
+                f'6-parameter r2 stays at or above {sweep["min r2 (6)"].min():.4f} at every '
+                f'distance, but the 24-parameter r2 falls to {far["min r2 (24)"]:.2f} at '
+                f'd = {far["d (mm)"]:.1f} mm (`{far["worst 24 column"]}`).',
+            ]
+        )
+    )
+)
+```
