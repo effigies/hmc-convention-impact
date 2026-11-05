@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 COLUMNS = ['trans_x', 'trans_y', 'trans_z', 'rot_x', 'rot_y', 'rot_z']
+ROTATIONS = COLUMNS[3:]
 
 
 def _valid(fd_a: np.ndarray, fd_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -130,3 +131,113 @@ def regress_out(
         index=target.columns,
     )
     return pd.DataFrame(resid, index=target.index, columns=target.columns), summary
+
+
+def rotation_term(params: pd.DataFrame, radius: float = 50.0) -> np.ndarray:
+    """FD's rotation term: ``radius`` times the summed absolute rotation changes.
+
+    Parameters
+    ----------
+    params : pandas.DataFrame
+        Motion parameters with ``rot_x rot_y rot_z`` in radians.
+    radius : float
+        Head radius in mm, as in FD.
+
+    Returns
+    -------
+    (T,) array
+        In mm; NaN at index 0.
+    """
+    raise NotImplementedError
+
+
+def relative_parts(
+    params_a: pd.DataFrame, params_b: pd.DataFrame, fd_a: np.ndarray, fd_b: np.ndarray
+) -> pd.DataFrame:
+    """Split the relative FD difference ``(fd_b - fd_a) / fd_a`` into FD's two terms.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``total``; ``rotation``, the difference of the rotation terms
+        (:func:`rotation_term`) over ``fd_a``; and ``translation``, the rest.
+        One row per frame; NaN at index 0.
+    """
+    raise NotImplementedError
+
+
+def relative_spread(fd_a: np.ndarray, fd_b: np.ndarray, q: float = 0.99) -> tuple[float, float]:
+    """How much higher or lower one FD series measures than the other, relative to it.
+
+    Both directions count: ``fd_b / fd_a - 1`` and ``fd_a / fd_b - 1``. A frame
+    one series measures at or below ``tau`` measures at most ``tau * (1 + up)``
+    under the other, for all but a fraction ``1 - q`` of frames; one it measures
+    above ``tau`` measures at least ``tau * (1 - down)``.
+
+    Parameters
+    ----------
+    fd_a, fd_b : numpy.ndarray
+        Framewise displacement series; frames with NaN or zero FD in either are skipped.
+    q : float
+        Quantile; 1 gives the sample maximum.
+
+    Returns
+    -------
+    tuple of float
+        ``(up, down)``: the larger ``q``-quantile, over both directions, of the
+        relative excess and of the relative shortfall.
+    """
+    raise NotImplementedError
+
+
+def relative_quantiles(
+    fd_a: np.ndarray,
+    fd_b: np.ndarray,
+    edges: np.ndarray,
+    q: tuple[float, ...] = (0.01, 0.5, 0.99),
+) -> pd.DataFrame:
+    """Quantiles of ``fd_b / fd_a - 1`` for frames binned by ``fd_a``.
+
+    Parameters
+    ----------
+    fd_a, fd_b : numpy.ndarray
+        Framewise displacement series; frames with NaN or zero FD in either are skipped.
+    edges : array_like
+        Bin edges for ``fd_a``; bins include their left edge. Frames outside are dropped.
+    q : tuple of float
+        Quantiles to report.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by bin (``pandas.IntervalIndex``), with one column per quantile
+        and ``n``, the number of frames; quantiles are NaN in empty bins.
+    """
+    raise NotImplementedError
+
+
+def disagreement_curve(
+    fd_a: np.ndarray, fd_b: np.ndarray, thresholds, edges: np.ndarray
+) -> pd.DataFrame:
+    """Disagreement as a function of relative distance from the threshold, pooled over thresholds.
+
+    For each threshold ``tau``, frames are binned by ``|fd_a - tau| / tau``; a
+    frame disagrees when ``(fd_a > tau) != (fd_b > tau)``. Each frame counts
+    once per threshold whose bins it falls in.
+
+    Parameters
+    ----------
+    fd_a, fd_b : numpy.ndarray
+        Framewise displacement series; frames with NaN in either are skipped.
+    thresholds : sequence of float
+        Thresholds to pool.
+    edges : array_like
+        Bin edges of the relative distance; bins include their left edge.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by bin (``pandas.IntervalIndex``), with ``p``, the fraction that
+        disagree (NaN in empty bins), and ``n``, the number of frames.
+    """
+    raise NotImplementedError
