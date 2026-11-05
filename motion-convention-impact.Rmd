@@ -16,7 +16,7 @@ jupyter:
 
 fMRIPrep reports MCFLIRT's and 3dvolreg's motion parameters on RAS+ axes, but each keeps its tool's rotation center and Euler order.
 So identical motion gives different parameters, and possibly different FD and censoring.
-This notebook measures the gap, to help choose between **preserving tool values** and **consistent determinations** (identical motion gives identical FD, whichever `--hmc` tool ran).
+This notebook measures the gap, to help choose between **preserving tool values** and **consistent determinations** (identical motion gives identical FD, whichever `--hmc-method` tool ran).
 
 ## Summary
 
@@ -46,10 +46,15 @@ from nipype.pipeline.engine import Node
 
 from hmc_impact.analysis import (
     COLUMNS,
+    ROTATIONS,
     censor_counts,
     disagreement,
+    disagreement_curve,
     expand24,
     regress_out,
+    relative_parts,
+    relative_quantiles,
+    relative_spread,
     threshold_bounds,
 )
 from hmc_impact.conventions import (
@@ -69,7 +74,6 @@ logging.getLogger('nipype.workflow').setLevel(logging.WARNING)
 CONVENTIONS = ('afni', 'fsl')
 LABEL = {'afni': 'AFNI', 'fsl': 'MCFLIRT'}
 COLOR = {'afni': 'tab:blue', 'fsl': 'tab:orange'}
-ROTATIONS = ['rot_x', 'rot_y', 'rot_z']
 
 _tmp = TemporaryDirectory()
 WORK = Path(_tmp.name)
@@ -121,23 +125,50 @@ def regression_summary(params):
     return pd.DataFrame.from_dict(rows, orient='index').rename_axis(['target', 'parameters'])
 
 
-def rotation_term(params):
-    """FD's rotation term, 50 mm × sum of absolute frame-to-frame rotation changes; NaN at 0."""
-    steps = np.abs(np.diff(params[ROTATIONS].to_numpy(), axis=0)).sum(axis=1)
-    return np.r_[np.nan, 50 * steps]
+def difference_stats(params, fd, rows, q):
+    """Relative FD difference over ``rows``: its FD terms, and ``relative_spread`` at ``q`` and 1."""
+    parts = relative_parts(params['afni'], params['fsl'], fd['afni'], fd['fsl']).iloc[rows].abs()
+    a, b = fd['afni'][rows], fd['fsl'][rows]
+    (up, down), (up_max, down_max) = relative_spread(a, b, q), relative_spread(a, b, 1)
+    return {
+        'max |rel. ΔFD|': parts['total'].max(),
+        'translation term': parts['translation'].max(),
+        'rotation term': parts['rotation'].max(),
+        'median': parts['total'].median(),
+        'up, pct': up,
+        'down, pct': down,
+        'up, max': up_max,
+        'down, max': down_max,
+    }
 
 
-def relative_parts(params, fd, step=slice(None)):
-    """(MCFLIRT − AFNI) / AFNI FD: total, and the parts from the rotation and translation terms."""
-    rot = {c: rotation_term(params[c])[step] for c in CONVENTIONS}
-    total = (fd['fsl'] - fd['afni']) / fd['afni']
-    rotation = (rot['fsl'] - rot['afni']) / fd['afni']
-    return pd.DataFrame({'total': total, 'rotation': rotation, 'translation': total - rotation})
+def pose_sd(params):
+    """Mean SD of the translations (mm) and of the rotations (degrees)."""
+    return params[COLUMNS[:3]].std().mean(), np.rad2deg(params[ROTATIONS].std()).mean()
+
+
+def pad_label(img, pad):
+    """Where ``pad_image`` adds voxels, as anatomical directions in mm."""
+    side = dict(zip('LRAPSI', ('right', 'left', 'posterior', 'anterior', 'inferior', 'superior')))
+    zooms = img.header.get_zooms()
+    parts = [
+        f'{before * zoom:g} mm {side[code]}'
+        for (before, _), zoom, code in zip(pad, zooms, nb.aff2axcodes(img.affine))
+        if before
+    ]
+    return ', '.join(parts) or 'none'
 
 
 def verdict(ok, bold=True):
     """'borne out' or 'not borne out', the latter in bold unless the caller already bolds it."""
     return 'borne out' if ok else ('**not borne out**' if bold else 'not borne out')
+
+
+def percentile(q):
+    """'99th percentile' for 0.99."""
+    n = round(100 * q)
+    suffix = 'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f'{n}{suffix} percentile'
 
 
 def pct_range(values):
@@ -294,8 +325,7 @@ display(
         f'{np.rad2deg(max_rot_diff):.2g}°, against a largest product of two angles of '
         f'{np.rad2deg(max_product):.2g}° and a largest rotation of '
         f'{np.rad2deg(angles.max()):.2g}°. '
-        f"On FD's 50 mm sphere, that difference is at most {50 * max_rot_diff:.2g} mm. "
-        'Its effect on FD is tested in the sample, under Center distance. '
+        'Its effect on FD is tested under Center distance. '
         f'The translations differ by up to {max_trans_diff:.2f} mm, because the rotation '
         'centers differ.'
     )
@@ -353,20 +383,178 @@ counts.rename_axis('τ (mm)')
 
 ## Threshold error
 
-The series has too few frames near each threshold for stable bounds.
-The bounds come instead from 10,000 independent frame pairs drawn from the same motion model, half of them within 15% of a threshold.
+The series has too few frames near each threshold for stable estimates.
+They come instead from a sample of independent frame pairs drawn from the same motion model, dense near the thresholds.
 Their transforms go through the same interfaces; 3dvolreg is not rerun.
-`BAND` sets the disagreement window, ±10% of τ.
+`QUANTILE` sets the percentile the bounds use, and `BAND` the window of the band-averaged disagreement.
 
 ```{python}
+QUANTILE = 0.99
 BAND = 0.1
 
 rng = np.random.default_rng(1)
 pairs = simulate_pairs(sample_fd_targets(10_000, rng), rng)
 sample_xfms = volreg_to_ras(pairs, boldref)
-sample_params, sample_fd = convert(sample_xfms, boldref, 'sample')
-sample_fd = {c: fd[1::2] for c, fd in sample_fd.items()}  # FD within each pair
+sample_params, sample_fd_all = convert(sample_xfms, boldref, 'sample')
+PAIRS = slice(1, None, 2)  # the frame-to-frame step within each pair
+sample_fd = {c: fd[PAIRS] for c, fd in sample_fd_all.items()}
+n_pairs = len(sample_fd['afni'])
+sd = {'sample': pose_sd(sample_params['afni']), 'series': pose_sd(series_params['afni'])}
 
+display(
+    Markdown(
+        f'{n_pairs:,} pairs. Their poses have SD {sd["sample"][0]:.2f} mm and '
+        f"{sd['sample'][1]:.2f}°, against the series' {sd['series'][0]:.2f} mm and "
+        f'{sd["series"][1]:.2f}°.'
+    )
+)
+```
+
+Does the relative FD difference depend on FD, and how does it compare with the `√3·d/50` worst case?
+
+```{python}
+FD_EDGES = np.arange(0, 1.75, 0.25)
+Q = (1 - QUANTILE, 0.5, QUANTILE)
+by_fd = pd.concat(
+    {
+        '(MCFLIRT − AFNI) / AFNI, by AFNI FD': relative_quantiles(
+            sample_fd['afni'], sample_fd['fsl'], FD_EDGES, Q
+        ),
+        '(AFNI − MCFLIRT) / MCFLIRT, by MCFLIRT FD': relative_quantiles(
+            sample_fd['fsl'], sample_fd['afni'], FD_EDGES, Q
+        ),
+    },
+    axis=1,
+)
+analytic = np.sqrt(3) * d_ref / 50
+rel = (sample_fd['fsl'] - sample_fd['afni']) / sample_fd['afni']
+
+fig, ax = plt.subplots(figsize=(8, 4), layout='constrained')
+ax.scatter(sample_fd['afni'], 100 * rel, s=2, color='0.6', alpha=0.3, lw=0)
+first = by_fd.columns.levels[0][0]
+for q, ls in zip(Q, ('-', ':', '-')):
+    ax.stairs(100 * by_fd[(first, q)], FD_EDGES, color='k', lw=1.2, ls=ls, baseline=None)
+for sign in (1, -1):
+    ax.axhline(sign * 100 * analytic, color='k', lw=1, ls='--')
+ax.text(1.5, 100 * analytic, f'±√3·d/50, d = {d_ref:.1f} mm', va='bottom', ha='right')
+ax.text(
+    1.5, 100 * by_fd[(first, QUANTILE)].iloc[-1], percentile(QUANTILE), va='bottom', ha='right'
+)
+ax.text(1.5, 100 * by_fd[(first, Q[0])].iloc[-1], percentile(Q[0]), va='top', ha='right')
+ax.set(xlabel='AFNI FD (mm)', ylabel='(MCFLIRT − AFNI) / AFNI FD (%)')
+plt.show()
+
+quantiles = by_fd.drop(columns='n', level=1)
+spans = {q: quantiles.xs(q, axis=1, level=1) for q in Q}
+span = max((s.max() - s.min()).max() for s in spans.values())
+FLAT = 0.02  # largest spread of a quantile across FD bins, as a fraction of FD
+flat = span < FLAT
+display(
+    Markdown(
+        f'Per FD bin, the {percentile(QUANTILE)} ranges {spans[QUANTILE].min().min():+.1%} to '
+        f'{spans[QUANTILE].max().max():+.1%}, the median {spans[0.5].min().min():+.1%} to '
+        f'{spans[0.5].max().max():+.1%}, and the {percentile(Q[0])} '
+        f'{spans[Q[0]].min().min():+.1%} to {spans[Q[0]].max().max():+.1%}. '
+        + (
+            f'No quantile moves by more than {100 * span:.1f} percentage points across bins '
+            f'(criterion: {100 * FLAT:g}): '
+            'in this sample, the relative difference does not depend on FD, so bounds on it '
+            'scale with τ.'
+            if flat
+            else f'A quantile moves by {100 * span:.1f} percentage points across bins, more than the '
+            f'{100 * FLAT:g}-point '
+            'criterion: the relative difference depends on FD, so the τ-scaled bounds below are '
+            'approximate.'
+        )
+    )
+)
+shown_q = by_fd.rename(columns=lambda q: q if q == 'n' else percentile(q), level=1)
+shown_q.style.format('{:+.1%}', subset=shown_q.drop(columns='n', level=1).columns).format_index(
+    lambda iv: f'{iv.left:g}–{iv.right:g} mm'
+)
+```
+
+How far from τ can a frame measure under the other convention?
+
+```{python}
+up, down = relative_spread(sample_fd['afni'], sample_fd['fsl'], QUANTILE)
+up_max, down_max = relative_spread(sample_fd['afni'], sample_fd['fsl'], 1)
+
+
+def headline(sign):
+    """Markdown table of τ·(1 ± q) for the percentile, the sample maximum and the analytic bound."""
+    cols = {
+        f'{QUANTILE:.0%} of frames': up if sign > 0 else down,
+        'sample maximum': up_max if sign > 0 else down_max,
+        'analytic, translation term only': analytic,
+    }
+    rows = [
+        '| τ (mm) | ' + ' | '.join(cols) + ' |',
+        '| --- ' * (len(cols) + 1) + '|',
+        *(
+            f'| {tau:g} | '
+            + ' | '.join(f'{tau * (1 + sign * q):.3f} ({sign * q:+.1%})' for q in cols.values())
+            + ' |'
+            for tau in THRESHOLDS
+        ),
+    ]
+    return '\n'.join(rows)
+
+
+headline_md = '\n'.join(
+    [
+        'A frame one convention keeps (FD ≤ τ) measures at most this under the other:',
+        '',
+        headline(1),
+        '',
+        'A frame one convention censors (FD > τ) measures at least this under the other:',
+        '',
+        headline(-1),
+    ]
+)
+display(Markdown(headline_md))
+```
+
+The percentile is stable; is the maximum?
+Each row averages 20 random subsamples of the pairs.
+
+```{python}
+sub_rng = np.random.default_rng(2)
+stability = {}
+for n in (1_000, 2_500, 5_000, n_pairs):
+    draws = [sub_rng.choice(n_pairs, n, replace=False) for _ in range(20)]
+    stability[n] = np.mean(
+        [
+            [
+                *relative_spread(sample_fd['afni'][i], sample_fd['fsl'][i], QUANTILE),
+                *relative_spread(sample_fd['afni'][i], sample_fd['fsl'][i], 1),
+            ]
+            for i in draws
+        ],
+        axis=0,
+    )
+stability = pd.DataFrame.from_dict(
+    stability,
+    orient='index',
+    columns=[f'up, {QUANTILE:.0%}', f'down, {QUANTILE:.0%}', 'up, max', 'down, max'],
+).rename_axis('pairs')
+growth = stability['up, max'].iloc[[0, -1]]
+pct_moves = stability[f'up, {QUANTILE:.0%}']
+display(
+    Markdown(
+        f'The maximum grows with sample size, from {growth.iloc[0]:+.1%} with '
+        f'{growth.index[0]:,} pairs to {growth.iloc[1]:+.1%} with {growth.index[1]:,}; '
+        f'the {percentile(QUANTILE)} stays between {pct_moves.min():+.2%} and '
+        f'{pct_moves.max():+.2%}. The sample maximum is not a guarantee: a larger sample would '
+        'raise it. The analytic bound covers only the translation term of FD.'
+    )
+)
+stability.style.format('{:+.1%}').format_index('{:,}')
+```
+
+Within this sample, the frames on the other side of τ, and the band-averaged disagreement:
+
+```{python}
 sample_bounds = bounds_table(sample_fd, BAND)
 (
     sample_bounds.style.format(precision=3)
@@ -375,48 +563,64 @@ sample_bounds = bounds_table(sample_fd, BAND)
 )
 ```
 
-```{python}
-lines = []
-for tau, row in sample_bounds.iterrows():
-    high = max(row['max MCFLIRT | AFNI ≤ τ'], row['max AFNI | MCFLIRT ≤ τ'])
-    low = min(row['min MCFLIRT | AFNI > τ'], row['min AFNI | MCFLIRT > τ'])
-    p = row.filter(like='P(disagree)')
-    lines.append(
-        f'- τ = {tau:g} mm: a frame kept by one convention measures up to {high:.3f} mm '
-        f'under the other; a frame censored by one measures as low as {low:.3f} mm. '
-        f'Within ±{BAND:.0%} of τ, {pct_range(p)} of frames are censored '
-        'by one convention only.'
-    )
-display(Markdown('\n'.join(lines)))
-```
-
-How large is the relative FD difference, compared with the `√3·d/50` worst case?
+How does the chance of disagreement fall with distance from τ?
+The frames are binned by `|FD − τ| / τ`, in steps of 1%.
 
 ```{python}
-PAIRS = slice(1, None, 2)  # rows of rotation_term() within each pair
-parts = relative_parts(sample_params, sample_fd, PAIRS)
-analytic = np.sqrt(3) * d_ref / 50
+DIST_EDGES = np.linspace(0, BAND, 11)
+curves = {
+    c: disagreement_curve(sample_fd[c], sample_fd[o], THRESHOLDS, DIST_EDGES)
+    for c, o in (('afni', 'fsl'), ('fsl', 'afni'))
+}
+per_tau = {
+    tau: disagreement_curve(sample_fd['afni'], sample_fd['fsl'], (tau,), DIST_EDGES)
+    for tau in THRESHOLDS
+}
 
-fig, ax = plt.subplots(figsize=(8, 4), layout='constrained')
-ax.scatter(sample_fd['afni'], 100 * parts['total'], s=2, color='0.4', alpha=0.3, lw=0)
-for sign in (1, -1):
-    ax.axhline(sign * 100 * analytic, color='k', lw=1, ls='--')
-ax.text(1.5, 100 * analytic, f'±√3·d/50, d = {d_ref:.1f} mm', va='bottom', ha='right')
-for tau in THRESHOLDS:
-    ax.axvline(tau, color='0.6', lw=0.8, ls=':')
-ax.set(xlabel='AFNI FD (mm)', ylabel='(MCFLIRT − AFNI) / AFNI FD (%)')
+# Pool the thresholds only if their curves agree: chi-square test of homogeneity per bin
+from scipy.stats import chi2, chi2_contingency
+
+hits = {t: (c['p'].fillna(0) * c['n']).round().astype(int) for t, c in per_tau.items()}
+stat = dof = 0
+for iv in per_tau[THRESHOLDS[0]].index:
+    table = np.array([[hits[t][iv], per_tau[t]['n'][iv] - hits[t][iv]] for t in THRESHOLDS])
+    if (table.sum(axis=0) > 0).all():
+        result = chi2_contingency(table)
+        stat, dof = stat + result.statistic, dof + result.dof
+homogeneous = chi2.sf(stat, dof)
+
+mid = 100 * (DIST_EDGES[:-1] + DIST_EDGES[1:]) / 2
+fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
+for tau, marker in zip(THRESHOLDS, 'os^'):
+    ax.plot(mid, 100 * per_tau[tau]['p'], marker, color='0.5', mfc='none', label=f'τ = {tau:g} mm')
+for c in CONVENTIONS:
+    ax.plot(mid, 100 * curves[c]['p'], color=COLOR[c], lw=1.5, label=f'pooled, {LABEL[c]} FD')
+ax.set(
+    xlabel='|FD − τ| / τ (%)',
+    ylabel='censored by one convention only (%)',
+    ylim=(0, None),
+)
+ax.legend(frameon=False)
 plt.show()
 
-worst = parts.abs().max()
+key_edges = [0, 0.01, 0.02, 0.04, 0.06, 0.08, BAND]
+key = disagreement_curve(sample_fd['afni'], sample_fd['fsl'], THRESHOLDS, key_edges)['p']
+curve_md = ', '.join(
+    f'{p:.0%} ' + ('within 1%' if iv.left == 0 else f'at {iv.left:.0%}–{iv.right:.0%}')
+    for iv, p in key.items()
+)
 display(
     Markdown(
-        f'Largest relative difference: {worst["total"]:.1%}; 99th percentile '
-        f'{parts["total"].abs().quantile(0.99):.1%}; median {parts["total"].abs().median():.1%}. '
-        f'The analytic worst case at d = {d_ref:.1f} mm is {analytic:.1%}, which the sample '
-        + ('respects. ' if worst['total'] <= analytic else '**exceeds**. ')
-        + 'Split by FD term: the translation term, which the bound describes, differs by up to '
-        f'{worst["translation"]:.1%} of FD; the rotation term, which differs only through '
-        f'Euler order, by up to {worst["rotation"]:.1%}.'
+        f'Pooled over thresholds (AFNI FD): {curve_md} of τ. '
+        + (
+            f'The thresholds agree (chi-square test of homogeneity, p = {homogeneous:.2f}), '
+            'as expected when the relative difference does not depend on FD, so they are pooled.'
+            if homogeneous > 0.05
+            else f'The thresholds differ (chi-square test of homogeneity, p = {homogeneous:.2g}); '
+            'the pooled curve averages them.'
+        )
+        + ' These rates come from a synthetic distribution of FD and motion directions. They '
+        'show how disagreement falls off near τ; they are not rates for real data.'
     )
 )
 ```
@@ -432,10 +636,24 @@ within = pd.concat(
     axis=1,
 )
 assert within.all(axis=None), within
+
+# How close the series comes to each threshold, and how many disagreements the curve predicts
+series_dist = {tau: np.abs(series_fd['afni'][1:] - tau) / tau for tau in THRESHOLDS}
+n_near = sum(int((dist <= BAND).sum()) for dist in series_dist.values())
+closest = min(dist.min() for dist in series_dist.values())
+pooled = curves['afni']['p']
+expected = sum(
+    pooled.iloc[i]
+    for dist in series_dist.values()
+    for i in pooled.index.get_indexer(dist)
+    if i >= 0
+)
 display(
     Markdown(
-        f"All {within.size} series bounds lie within the sample's: "
-        'the sample covers what the real registration produced.'
+        f"All {within.size} series bounds lie within the sample's: the series is consistent "
+        f'with the sample. That is a weak check: only {n_near} series frames lie within '
+        f'±{BAND:.0%} of a threshold, and none closer than {closest:.1%}. For those frames, the '
+        f'pooled curve predicts about {expected:.1f} disagreements; the series has {len(flagged)}.'
     )
 )
 pd.concat(
@@ -456,14 +674,11 @@ series_regression.style.format('{:.6f}', subset=['min r2', 'max r2']).format(
 
 ```{python}
 series_resid = series_regression.groupby(level='parameters')['max rel. resid. SD'].max()
-e3_series = {model: sd < SMALL_RESIDUAL for model, sd in series_resid.items()}
 display(
     Markdown(
-        f'**Expectation 3, series: {verdict(e3_series["6"], bold=False)} for 6 parameters, '
-        f'{verdict(e3_series["24"], bold=False)} for 24.** The residual SD is at most '
-        f"{series_resid['6']:.2g} (6) and {series_resid['24']:.2g} (24) of each column's SD, "
-        f'against the {SMALL_RESIDUAL:.0%} criterion. The sample, with larger poses, is tested '
-        'under Center distance.'
+        f'On the reference grid, the residual SD is at most {series_resid["6"]:.2g} (6) and '
+        f"{series_resid['24']:.2g} (24) of each column's SD. Expectation 3 is judged across "
+        'center distances, under Center distance.'
     )
 )
 ```
@@ -491,59 +706,101 @@ plt.show()
 
 ## Center distance
 
-The sample transforms are re-expressed on padded copies of the reference (re-parameterized, not re-registered).
+The center distance d runs from the grid center to the center of gravity. It depends on the field of view and on where the brain sits in it.
+The series and sample transforms are re-expressed on padded copies of the reference (re-parameterized, not re-registered).
 Padding with the image minimum moves the grid center, and with it AFNI's rotation center, but leaves the center of gravity in place.
+Each row names where the padding goes.
 
 ```{python}
-PADS = {
-    'none': [(0, 0), (0, 0), (0, 0)],
-    **{f'axis 0 +{p}': [(p, 0), (0, 0), (0, 0)] for p in (5, 10, 20)},
-    **{f'axis 1 +{p}': [(0, 0), (p, 0), (0, 0)] for p in (5, 10, 20)},
-    'diagonal (10, 10, 5)': [(10, 0), (10, 0), (5, 0)],
-}
+PADS = [
+    [(0, 0), (0, 0), (0, 0)],
+    *([(p, 0), (0, 0), (0, 0)] for p in (5, 10, 20)),
+    *([(0, 0), (p, 0), (0, 0)] for p in (5, 10, 20)),
+    [(10, 0), (10, 0), (5, 0)],
+]
+SERIES = slice(1, None)  # every frame-to-frame step
 
-sweep, sweep_bounds = {}, {}
-for i, (name, pad) in enumerate(PADS.items()):
+sweep, series_sweep, sweep_bounds = {}, {}, {}
+for i, pad in enumerate(PADS):
+    name = pad_label(boldref, pad)
     if name == 'none':
-        img, params, fd = boldref, sample_params, sample_fd
+        img, s_params, s_fd, x_params, x_fd = (
+            boldref,
+            sample_params,
+            sample_fd_all,
+            series_params,
+            series_fd,
+        )
     else:
         img = pad_image(boldref, pad)
-        params, fd = convert(sample_xfms, img, f'pad{i}')
-        fd = {c: f[PAIRS] for c, f in fd.items()}
+        s_params, s_fd = convert(sample_xfms, img, f'pad{i}')
+        x_params, x_fd = convert(series_xfms, img, f'series_pad{i}')
     d = center_distance(img)
-    rel = relative_parts(params, fd, PAIRS).abs()
-    reg_all = regression_summary(params)
-    reg = reg_all.xs('24', level='parameters')
+    bound = {'d (mm)': d, '√3·d/50': np.sqrt(3) * d / 50}
+    sample_reg, series_reg = regression_summary(s_params), regression_summary(x_params)
     sweep[name] = {
-        'd (mm)': d,
-        '√3·d/50': np.sqrt(3) * d / 50,
-        'max |rel. ΔFD|': rel['total'].max(),
-        'translation term': rel['translation'].max(),
-        'rotation term': rel['rotation'].max(),
-        '99th pct': rel['total'].quantile(0.99),
-        'median': rel['total'].median(),
-        'min r2 (6)': reg_all.xs('6', level='parameters')['min r2'].min(),
-        'min r2 (24)': reg['min r2'].min(),
-        'resid. SD (6)': reg_all.xs('6', level='parameters')['max rel. resid. SD'].max(),
-        'resid. SD (24)': reg['max rel. resid. SD'].max(),
-        'worst 24 column': reg.loc[reg['min r2'].idxmin(), 'worst column'],
+        **bound,
+        **difference_stats(s_params, s_fd, PAIRS, QUANTILE),
+        'resid. SD (6)': sample_reg.xs('6', level='parameters')['max rel. resid. SD'].max(),
+        'resid. SD (24)': sample_reg.xs('24', level='parameters')['max rel. resid. SD'].max(),
     }
-    sweep_bounds[name] = bounds_table(fd, BAND)
+    reg24 = series_reg.xs('24', level='parameters')
+    series_sweep[name] = {
+        **bound,
+        **difference_stats(x_params, x_fd, SERIES, QUANTILE),
+        'min r2 (6)': series_reg.xs('6', level='parameters')['min r2'].min(),
+        'min r2 (24)': reg24['min r2'].min(),
+        'resid. SD (6)': series_reg.xs('6', level='parameters')['max rel. resid. SD'].max(),
+        'resid. SD (24)': reg24['max rel. resid. SD'].max(),
+        'worst 24 column': reg24.loc[reg24['max rel. resid. SD'].idxmax(), 'worst column'],
+    }
+    sweep_bounds[name] = bounds_table({c: f[PAIRS] for c, f in s_fd.items()}, BAND)
 
 sweep = pd.DataFrame.from_dict(sweep, orient='index').sort_values('d (mm)')
-sweep_bounds = pd.concat(sweep_bounds, names=['pad'])
-sweep.style.format(precision=3).format('{:.1f}', subset=['d (mm)']).format(
+series_sweep = pd.DataFrame.from_dict(series_sweep, orient='index').loc[sweep.index]
+sweep_bounds = pd.concat(sweep_bounds, names=['padding'])
+near, far, ref = sweep.iloc[0], sweep.iloc[-1], sweep.loc['none']
+display(Markdown('The sample, per padding (relative FD differences, and regression):'))
+sweep.rename_axis('padding').style.format(precision=3).format('{:.1f}', subset=['d (mm)'])
+```
+
+The series, per padding:
+
+```{python}
+series_sweep.drop(columns=['up, pct', 'down, pct', 'up, max', 'down, max']).rename_axis(
+    'padding'
+).style.format(precision=3).format('{:.1f}', subset=['d (mm)']).format(
     '{:.4f}', subset=['min r2 (6)', 'min r2 (24)']
 )
 ```
 
-The bounds and disagreement per threshold, for each padding:
+How do the bounds at each threshold move with center distance?
+
+```{python}
+spread_bounds = pd.DataFrame(
+    {
+        (f'τ = {tau:g}', side): tau * (1 + sign * sweep[f'{side}, pct'])
+        for tau in THRESHOLDS
+        for side, sign in (('up', 1), ('down', -1))
+    }
+)
+spread_bounds.insert(0, 'd (mm)', sweep['d (mm)'])
+display(
+    Markdown(
+        f'FD under the other convention, for {QUANTILE:.0%} of frames kept (up) or censored '
+        '(down) at τ, in mm:'
+    )
+)
+spread_bounds.rename_axis('padding').style.format(precision=3).format('{:.1f}', subset=['d (mm)'])
+```
+
+The bounds and band-averaged disagreement per threshold, for each padding:
 
 ```{python}
 sweep_bounds.loc[sweep.index].drop(columns=sweep_bounds.filter(like='n |').columns).round(3)
 ```
 
-Does the worst-case relative FD difference grow with center distance as the analytic bound says?
+Does the relative FD difference grow with center distance as the analytic bound says?
 
 ```{python}
 slope = np.polyfit(sweep['d (mm)'], sweep['max |rel. ΔFD|'], 1)[0]
@@ -551,60 +808,95 @@ d_grid = np.linspace(0, sweep['d (mm)'].max() * 1.05, 2)
 
 fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
 ax.plot(d_grid, 100 * np.sqrt(3) * d_grid / 50, color='k', ls='--', lw=1, label='√3·d/50')
-ax.plot(sweep['d (mm)'], 100 * sweep['max |rel. ΔFD|'], 'o', color='k', label='max, total')
-ax.plot(
-    sweep['d (mm)'], 100 * sweep['translation term'], 'x', color='k', label='max, translation term'
-)
-ax.plot(
-    sweep['d (mm)'], 100 * sweep['rotation term'], 'd', color='0.6', label='max, rotation term'
-)
-ax.plot(
-    sweep['d (mm)'], 100 * sweep['99th pct'], 's', color='0.4', mfc='none', label='99th percentile'
-)
-ax.plot(sweep['d (mm)'], 100 * sweep['median'], '^', color='0.4', mfc='none', label='median')
+marks = [
+    (sweep, 'max |rel. ΔFD|', 'o', 'k', 'sample, max'),
+    (sweep, 'translation term', 'x', 'k', 'sample, max, translation term'),
+    (sweep, 'rotation term', 'd', '0.6', 'sample, max, rotation term'),
+    (sweep, 'up, pct', 's', '0.4', f'sample, {percentile(QUANTILE)} (up)'),
+    (series_sweep, 'max |rel. ΔFD|', '*', COLOR['afni'], 'series, max'),
+]
+for table, column, marker, color, label in marks:
+    ax.plot(table['d (mm)'], 100 * table[column], marker, color=color, mfc='none', label=label)
 ax.set(xlabel='grid center to center of gravity (mm)', ylabel='|relative FD difference| (%)')
 ax.legend(frameon=False, fontsize='small')
 plt.show()
 
 
-def over_bound(column):
+def over_bound(table, column):
     """Paddings, with distances, where ``column`` exceeds √3·d/50."""
-    over = sweep[sweep[column] > sweep['√3·d/50']]
-    return [f'{name} (d = {d:.1f} mm)' for name, d in over['d (mm)'].items()]
+    over = table[table[column] > table['√3·d/50']]
+    return [f'the grid padded {name} (d = {d:.1f} mm)' for name, d in over['d (mm)'].items()]
 
 
-over_total, over_translation = over_bound('max |rel. ΔFD|'), over_bound('translation term')
-near, far = sweep.iloc[0], sweep.iloc[-1]
-ref = sweep.loc['none']
-rot_max = sweep['rotation term'].max()
-e1_fd = rot_max < NEGLIGIBLE_FD
-e2 = not over_translation
+over = {
+    (label, column): over_bound(table, column)
+    for label, table in (('sample', sweep), ('series', series_sweep))
+    for column in ('max |rel. ΔFD|', 'translation term')
+}
+e2 = not (over[('sample', 'translation term')] or over[('series', 'translation term')])
+over_total = over[('sample', 'max |rel. ΔFD|')] + over[('series', 'max |rel. ΔFD|')]
+translation_share = max(
+    (t['translation term'] / t['√3·d/50']).max() for t in (sweep, series_sweep)
+)
+
+
+def total_md(label, sd_rot):
+    hits = over[(label, 'max |rel. ΔFD|')]
+    where = ', '.join(hits)
+    return f'In the {label} (pose SD {sd_rot:.2f}°), the total ' + (
+        f'**exceeds the bound for {where}**.' if hits else 'stays under the bound.'
+    )
+
+
 display(
     Markdown(
         f'From d = {near["d (mm)"]:.1f} to {far["d (mm)"]:.1f} mm, the largest relative FD '
-        f'difference grows by {100 * slope:.2f}% per mm (linear fit; the analytic worst case '
-        f'is {100 * np.sqrt(3) / 50:.2f}% per mm).\n\n'
+        f'difference in the sample grows by {100 * slope:.2f}% per mm (linear fit; the analytic '
+        f'worst case is {100 * np.sqrt(3) / 50:.2f}% per mm).\n\n'
         f'**Expectation 2: {verdict(e2, bold=False)} for the translation term**, which '
         + (
-            'stays under √3·d/50 at every distance, at most '
-            f'{(sweep["translation term"] / sweep["√3·d/50"]).max():.0%} of it. '
+            'stays under √3·d/50 at every distance, in the series and the sample, at most '
+            f'{translation_share:.0%} of it. '
             if e2
-            else f'exceeds √3·d/50 for {", ".join(over_translation)}. '
+            else 'exceeds √3·d/50 for '
+            + ', '.join(
+                over[('sample', 'translation term')] + over[('series', 'translation term')]
+            )
+            + '. '
         )
-        + 'Typical frames are smaller: the median is at most '
+        + 'Typical frames are smaller: the sample median is at most '
         f'{(sweep["median"] / sweep["√3·d/50"]).max():.0%} of the bound. '
-        + (
-            'The total FD difference also stays under the bound.'
-            if not over_total
-            else f'**The total exceeds the bound for {", ".join(over_total)}**, because of the '
-            'rotation term (Expectation 1).'
-        )
-        + f'\n\n**Expectation 1, FD: {verdict(e1_fd, bold=False)}.** The rotation term, which differs '
-        f'only through Euler order, changes FD by up to {ref["rotation term"]:.1%} at '
-        f'd = {ref["d (mm)"]:.1f} mm and {rot_max:.1%} at worst, against the '
-        f'{NEGLIGIBLE_FD:.0%} criterion, whatever the center distance. At '
-        f'd = {near["d (mm)"]:.1f} mm it is {near["rotation term"]:.1%}, against the '
-        f"translation term's {near['translation term']:.1%}."
+        + total_md('series', sd['series'][1])
+        + ' '
+        + total_md('sample', sd['sample'][1])
+        + (' The excess is the rotation term (Expectation 1).' if over_total else '')
+    )
+)
+```
+
+Expectation 1 for FD: how much does the rotation term, which differs only through Euler order, change FD?
+Padding doesn't change the rotations, so the rotation terms' difference is the same at every distance; only the AFNI FD it is divided by changes.
+
+```{python}
+rot = {'series': series_sweep['rotation term'], 'sample': sweep['rotation term']}
+e1_fd = max(r.max() for r in rot.values()) < NEGLIGIBLE_FD
+
+
+def rotation_md(label):
+    r = rot[label]
+    return (
+        f'up to {r["none"]:.1%} on the reference grid ({r.min():.1%}–{r.max():.1%} across '
+        'paddings)'
+    )
+
+
+display(
+    Markdown(
+        f'**Expectation 1, FD: {verdict(e1_fd, bold=False)}** against the {NEGLIGIBLE_FD:.0%} '
+        f'criterion. On the series (pose SD {sd["series"][1]:.2f}°), the rotation term changes '
+        f'FD by {rotation_md("series")}. In the sample (pose SD {sd["sample"][1]:.2f}°), it '
+        f'changes FD by {rotation_md("sample")}. It is larger with the larger poses and does not '
+        'grow with center distance.'
     )
 )
 ```
@@ -618,9 +910,9 @@ for tau, marker in zip(THRESHOLDS, 'os^'):
     ax.plot(
         sweep['d (mm)'],
         100 * p_afni[tau],
-        marker=marker,
+        marker,
         color='k',
-        lw=0.8,
+        mfc='none',
         label=f'τ = {tau:g} mm',
     )
 ax.set(
@@ -635,31 +927,46 @@ plt.show()
 Does regression still remove one convention from the other as center distance grows?
 
 ```{python}
-pose_sd = {
-    name: (p['afni'][COLUMNS[:3]].std().mean(), np.rad2deg(p['afni'][ROTATIONS].std().mean()))
-    for name, p in (('sample', sample_params), ('series', series_params))
-}
-sd6_max = sweep['resid. SD (6)'].max()
-over24 = sweep[sweep['resid. SD (24)'] >= SMALL_RESIDUAL]
-e3_sample = {'6': sd6_max < SMALL_RESIDUAL, '24': over24.empty}
+e3_series = {m: (series_sweep[f'resid. SD ({m})'] < SMALL_RESIDUAL).all() for m in ('6', '24')}
+e3_sample = {m: (sweep[f'resid. SD ({m})'] < SMALL_RESIDUAL).all() for m in ('6', '24')}
+series_over24 = series_sweep[series_sweep['resid. SD (24)'] >= SMALL_RESIDUAL]
+sample_over24 = sweep[sweep['resid. SD (24)'] >= SMALL_RESIDUAL]
+series_ok24 = series_sweep[series_sweep['resid. SD (24)'] < SMALL_RESIDUAL]
+worst = series_sweep.loc[series_sweep['resid. SD (24)'].idxmax()]
+
+
+def model_md(table, model):
+    return f"at most {table[f'resid. SD ({model})'].max():.2g} of the column's SD"
+
+
 display(
     Markdown(
-        f'**Expectation 3, sample: {verdict(e3_sample["6"], bold=False)} for 6 parameters, '
-        f'{verdict(e3_sample["24"], bold=False)} for 24.** With 6, the residual SD is at most '
-        f"{sd6_max:.2g} of the column's SD (r2 ≥ {sweep['min r2 (6)'].min():.4f}) at every "
-        'distance. '
+        f'**Expectation 3, series: {verdict(e3_series["6"], bold=False)} for 6 parameters, '
+        f'{verdict(e3_series["24"], bold=False)} for 24.** With 6, the residual SD is '
+        f'{model_md(series_sweep, "6")} at every distance. With 24, it is '
         + (
-            f'With 24, it is at most {sweep["resid. SD (24)"].max():.2g}.'
-            if e3_sample['24']
-            else f'With 24, it reaches the {SMALL_RESIDUAL:.0%} criterion at {len(over24)} of '
-            f'{len(sweep)} distances, from d = {over24["d (mm)"].min():.1f} mm, and '
-            f'{far["resid. SD (24)"]:.2f} (r2 {far["min r2 (24)"]:.2f}, '
-            f'`{far["worst 24 column"]}`) at d = {far["d (mm)"]:.1f} mm.'
+            f'{model_md(series_sweep, "24")}.'
+            if e3_series['24']
+            else (
+                f'under the {SMALL_RESIDUAL:.0%} criterion up to d = '
+                f'{series_ok24["d (mm)"].max():.1f} mm ({series_ok24["resid. SD (24)"].max():.2g}) '
+                if not series_ok24.empty
+                else ''
+            )
+            + f'and over it at {len(series_over24)} of {len(series_sweep)} distances, from '
+            f'd = {series_over24["d (mm)"].min():.1f} mm, reaching '
+            f'{worst["resid. SD (24)"]:.2f} (`{worst["worst 24 column"]}`) at '
+            f'd = {worst["d (mm)"]:.1f} mm.'
         )
-        + f" The sample's poses (SD {pose_sd['sample'][0]:.2f} mm, {pose_sd['sample'][1]:.2f}°) "
-        f"are larger than the series' ({pose_sd['series'][0]:.2f} mm, "
-        f'{pose_sd["series"][1]:.2f}°), so its residuals are larger than in the Regression '
-        'section at the same distance.'
+        + '\n\nThe sample is made of independent poses, not a time series, so its 24-parameter '
+        'derivatives difference unrelated poses. With that caveat, its 6-parameter '
+        f'residual SD is {model_md(sweep, "6")}, and the 24-parameter one '
+        + (
+            f'{model_md(sweep, "24")}.'
+            if e3_sample['24']
+            else f'reaches the criterion at {len(sample_over24)} of {len(sweep)} distances, '
+            f'up to {sweep["resid. SD (24)"].max():.2f}.'
+        )
     )
 )
 ```
@@ -693,67 +1000,88 @@ display(
 
 ```{python}
 # Fill in the summary at the top
-rows = []
-for tau, row in sample_bounds.iterrows():
-    high = max(row['max MCFLIRT | AFNI ≤ τ'], row['max AFNI | MCFLIRT ≤ τ'])
-    low = min(row['min MCFLIRT | AFNI > τ'], row['min AFNI | MCFLIRT > τ'])
-    rows.append(
-        f'| {tau:g} | {high:.3f} ({high / tau - 1:+.1%}) | {low:.3f} ({low / tau - 1:+.1%}) '
-        f'| {pct_range(row.filter(like="P(disagree)"))} |'
-    )
-p_range = sweep_bounds.filter(like='P(disagree)').stack()
+band_p = sweep_bounds.filter(like='P(disagree)')
+distance_lines = [
+    f'  - τ = {tau:g} mm: kept frames measure up to '
+    f'{tau * (1 + near["up, pct"]):.3f} mm at d = {near["d (mm)"]:.1f} mm and '
+    f'{tau * (1 + far["up, pct"]):.3f} mm at {far["d (mm)"]:.1f} mm; censored frames as low as '
+    f'{tau * (1 - near["down, pct"]):.3f} and {tau * (1 - far["down, pct"]):.3f} mm.'
+    for tau in THRESHOLDS
+]
+e3_24 = (
+    f'borne out up to d = {series_ok24["d (mm)"].max():.1f} mm '
+    f'({series_ok24["resid. SD (24)"].max():.2g}), **not borne out** from '
+    f'd = {series_over24["d (mm)"].min():.1f} mm, reaching {worst["resid. SD (24)"]:.2f} at '
+    f'd = {worst["d (mm)"]:.1f} mm'
+    if not (series_ok24.empty or series_over24.empty)
+    else f'{verdict(e3_series["24"])} (residual SD at most '
+    f'{series_sweep["resid. SD (24)"].max():.2g})'
+)
 
 summary.update(
     Markdown(
         '\n'.join(
             [
-                'Worst case over both directions, from 10,000 simulated frame pairs on the '
-                f'reference grid (center distance d = {d_ref:.1f} mm):',
+                f'**Threshold bounds.** In this simulated sample ({n_pairs:,} frame pairs, pose SD '
+                f'{sd["sample"][1]:.1f}°, on the reference grid, where the center distance is '
+                f'd = {d_ref:.1f} mm), the relative FD difference between the conventions '
+                + ('does not depend on FD' if flat else '**depends on FD**')
+                + ', so the bounds scale with τ.',
                 '',
-                '| τ (mm) | kept by one; the other measures up to | censored by one; the other '
-                f'measures as low as | censored by one only, within ±{BAND:.0%} of τ |',
-                '| --- | --- | --- | --- |',
-                *rows,
+                headline_md,
                 '',
-                f'- **Relative FD difference** at d = {d_ref:.1f} mm: at most '
-                f'{ref["max |rel. ΔFD|"]:.1%}, median {ref["median"]:.1%}.',
-                f'- **Center distance**, from {near["d (mm)"]:.1f} to {far["d (mm)"]:.1f} mm: the '
-                f'largest relative difference grows by {100 * slope:.2f}% per mm, to '
-                f'{far["max |rel. ΔFD|"]:.0%}. Disagreement within ±{BAND:.0%} of τ ranges '
-                f'{pct_range(p_range)}, from '
-                f'{pct_range(sweep_bounds.loc[near.name].filter(like="P(disagree)").stack())} at '
-                f'{near["d (mm)"]:.1f} mm to '
-                f'{pct_range(sweep_bounds.loc[far.name].filter(like="P(disagree)").stack())} at '
-                f'{far["d (mm)"]:.1f} mm.',
-                f'- **3dvolreg series:** {len(flagged)} of {len(series_fd["afni"]) - 1} frames '
-                'are censored by one convention only, at any threshold.',
+                f'- **The maximum is not a guarantee.** It grows with sample size (from '
+                f'{growth.iloc[0]:+.1%} with {growth.index[0]:,} pairs to {growth.iloc[1]:+.1%} '
+                f'with {growth.index[1]:,}); the {percentile(QUANTILE)} is stable '
+                f'({pct_moves.min():+.2%} to {pct_moves.max():+.2%}). The analytic bound covers '
+                "only FD's translation term.",
+                f'- **Disagreement near τ** falls steeply with distance from it: {curve_md} of τ '
+                f'(averaged over ±{BAND:.0%}: {pct_range(sample_bounds.filter(like="P(disagree)").stack())}). '
+                'These rates come from a synthetic distribution of FD and motion directions, '
+                'not from real data.',
+                f'- **Center distance.** The bounds widen with d, which depends on the field of '
+                'view and where the brain sits in it. From '
+                f'd = {near["d (mm)"]:.1f} to {far["d (mm)"]:.1f} mm (sample, {percentile(QUANTILE)}):',
+                *distance_lines,
+                f'  - Band-averaged disagreement rises from {pct_range(band_p.loc[near.name].stack())} '
+                f'to {pct_range(band_p.loc[far.name].stack())}.',
+                f'- **3dvolreg series:** {len(flagged)} of {len(series_fd["afni"]) - 1} frames are '
+                f'censored by one convention only, at any threshold. Only {n_near} frames lie within '
+                f'±{BAND:.0%} of a threshold, none closer than {closest:.1%}; the disagreement curve '
+                f'predicts about {expected:.1f} among them.',
                 f'- **Expectation 1** (Euler order is negligible): {verdict(e1_params)} for the '
-                f'parameters (at most {np.rad2deg(max_rot_diff):.2g}°); {verdict(e1_fd)} for FD, '
-                f'which it changes by up to {ref["rotation term"]:.1%} at '
-                f'd = {ref["d (mm)"]:.1f} mm and {rot_max:.1%} at worst.',
+                f'parameters (at most {np.rad2deg(max_rot_diff):.2g}°); {verdict(e1_fd)} for FD. '
+                f'The rotation term changes FD by up to {rot["series"].max():.1%} on the series (pose SD '
+                f'{sd["series"][1]:.2f}°) and {rot["sample"].max():.1%} in the sample '
+                f'({sd["sample"][1]:.2f}°), against the {NEGLIGIBLE_FD:.0%} criterion.',
                 f'- **Expectation 2** (√3·d/50 bounds the change): {verdict(e2)} for the '
                 'translation term'
                 + (
                     ' at every distance'
                     if e2
-                    else f', which exceeds it for {", ".join(over_translation)}'
+                    else ', which exceeds it for '
+                    + ', '.join(
+                        over[('sample', 'translation term')] + over[('series', 'translation term')]
+                    )
                 )
+                + '. The total '
                 + (
-                    '; the total stays under it too.'
+                    'stays under it too.'
                     if not over_total
-                    else f'; the total exceeds it for {", ".join(over_total)}, because of '
-                    'Euler order.'
+                    else f'exceeds it in the sample (pose SD {sd["sample"][1]:.1f}°) for '
+                    + ', '.join(over[('sample', 'max |rel. ΔFD|')])
+                    + ', because of Euler order'
+                    + (
+                        '; on the series it stays under.'
+                        if not over[('series', 'max |rel. ΔFD|')]
+                        else ', and on the series for '
+                        + ', '.join(over[('series', 'max |rel. ΔFD|')])
+                        + '.'
+                    )
                 ),
-                f'- **Expectation 3** (regression leaves little): for 6 parameters, '
-                f'{verdict(e3_series["6"] and e3_sample["6"])} (residual SD at most '
-                f'{max(series_resid["6"], sd6_max):.2g}); for 24, {verdict(e3_series["24"])} on '
-                f'the series ({series_resid["24"]:.2g}) and {verdict(e3_sample["24"])} in the '
-                + (
-                    f'sample ({sweep["resid. SD (24)"].max():.2g}).'
-                    if e3_sample['24']
-                    else f'sample from d = {over24["d (mm)"].min():.1f} mm, reaching '
-                    f'{far["resid. SD (24)"]:.2f} at d = {far["d (mm)"]:.1f} mm.'
-                ),
+                f'- **Expectation 3** (regression leaves little), on the series: for 6 parameters, '
+                f'{verdict(e3_series["6"])} (residual SD at most '
+                f'{series_sweep["resid. SD (6)"].max():.2g} at every distance); for 24, {e3_24}.',
             ]
         )
     )
