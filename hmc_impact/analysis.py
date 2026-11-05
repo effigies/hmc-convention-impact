@@ -14,6 +14,13 @@ def _valid(fd_a: np.ndarray, fd_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return a[keep], b[keep]
 
 
+def _positive(fd_a: np.ndarray, fd_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return both series restricted to frames finite and positive in each."""
+    a, b = _valid(fd_a, fd_b)
+    keep = (a > 0) & (b > 0)
+    return a[keep], b[keep]
+
+
 def threshold_bounds(fd_a: np.ndarray, fd_b: np.ndarray, tau: float) -> tuple[float, float]:
     """Bound ``fd_b`` by the censoring decision made on ``fd_a``.
 
@@ -148,7 +155,8 @@ def rotation_term(params: pd.DataFrame, radius: float = 50.0) -> np.ndarray:
     (T,) array
         In mm; NaN at index 0.
     """
-    raise NotImplementedError
+    steps = np.abs(np.diff(params[ROTATIONS].to_numpy(float), axis=0)).sum(axis=1)
+    return np.r_[np.nan, radius * steps]
 
 
 def relative_parts(
@@ -163,7 +171,10 @@ def relative_parts(
         (:func:`rotation_term`) over ``fd_a``; and ``translation``, the rest.
         One row per frame; NaN at index 0.
     """
-    raise NotImplementedError
+    fd_a, fd_b = np.asarray(fd_a, float), np.asarray(fd_b, float)
+    total = (fd_b - fd_a) / fd_a
+    rotation = (rotation_term(params_b) - rotation_term(params_a)) / fd_a
+    return pd.DataFrame({'total': total, 'rotation': rotation, 'translation': total - rotation})
 
 
 def relative_spread(fd_a: np.ndarray, fd_b: np.ndarray, q: float = 0.99) -> tuple[float, float]:
@@ -187,7 +198,11 @@ def relative_spread(fd_a: np.ndarray, fd_b: np.ndarray, q: float = 0.99) -> tupl
         ``(up, down)``: the larger ``q``-quantile, over both directions, of the
         relative excess and of the relative shortfall.
     """
-    raise NotImplementedError
+    a, b = _positive(fd_a, fd_b)
+    ratios = (b / a, a / b)
+    up = max(np.quantile(r - 1, q) for r in ratios)
+    down = max(np.quantile(1 - r, q) for r in ratios)
+    return float(up), float(down)
 
 
 def relative_quantiles(
@@ -213,7 +228,12 @@ def relative_quantiles(
         Indexed by bin (``pandas.IntervalIndex``), with one column per quantile
         and ``n``, the number of frames; quantiles are NaN in empty bins.
     """
-    raise NotImplementedError
+    a, b = _positive(fd_a, fd_b)
+    bins = pd.IntervalIndex.from_breaks(edges, closed='left')
+    groups = pd.Series(b / a - 1).groupby(pd.cut(a, bins), observed=False)
+    table = groups.quantile(list(q)).unstack()
+    table['n'] = groups.size()
+    return table.set_axis(bins)
 
 
 def disagreement_curve(
@@ -240,4 +260,11 @@ def disagreement_curve(
         Indexed by bin (``pandas.IntervalIndex``), with ``p``, the fraction that
         disagree (NaN in empty bins), and ``n``, the number of frames.
     """
-    raise NotImplementedError
+    a, b = _valid(fd_a, fd_b)
+    bins = pd.IntervalIndex.from_breaks(edges, closed='left')
+    frames = pd.concat(
+        pd.DataFrame({'dist': np.abs(a - tau) / tau, 'disagree': (a > tau) != (b > tau)})
+        for tau in thresholds
+    )
+    groups = frames['disagree'].groupby(pd.cut(frames['dist'], bins), observed=False)
+    return pd.DataFrame({'p': groups.mean(), 'n': groups.size()}).set_axis(bins)
