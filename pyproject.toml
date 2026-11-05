@@ -1,0 +1,33 @@
+[project]
+name = "hmc-convention-impact"
+version = "0.1.0"
+description = "Quantify how AFNI and MCFLIRT head-motion conventions change FD and confound regression."
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "fmriprep",
+    "ipykernel>=7.4.0",
+    "jupyterlab>=4.6.5",
+    "jupytext>=1.19.6",
+    "matplotlib>=3.11.2",
+    "niworkflows",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+    "typer>=0.27.3",
+]
+
+[tool.uv.sources]
+niworkflows = { git = "https://github.com/nipreps/niworkflows", rev = "0bdee79e" }
+fmriprep = { git = "https://github.com/effigies/fmriprep", rev = "18076e21e9fbde7ae9e2b8ebddbff532bdea6618" }
+
+[tool.ruff]
+line-length = 99
+
+[tool.ruff.format]
+quote-style = 'single'
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+pythonpath = ['.']
